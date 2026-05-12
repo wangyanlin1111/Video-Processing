@@ -1,0 +1,158 @@
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
+
+import os
+import time
+import re
+import multiprocessing
+import subprocess
+from pathlib import Path
+from shlex import quote
+from commonfunc import converttime
+
+RED = "\033[91m"    
+GREEN = "\033[92m"  
+YELLOW = "\033[93m"  
+BLUE = "\033[94m"  
+PUPPLE = "\033[95m"  
+RESET = "\033[0m"
+
+def get_crop_filter(video_path):
+    try:
+        cmd = [
+            'ffmpeg', '-hide_banner', '-i', video_path,
+            '-t', '60',
+            '-vf', 'cropdetect', '-f', 'null', '-'
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        match = re.search(r'crop=(\d+:\d+:\d+:\d+)', res.stderr)
+        if match:
+            return f"crop={match.group(1)}"
+    except:
+        pass
+    return ""
+
+def compose_video(
+    video_path, 
+    subtitle_path, 
+    bgm_path, 
+    voice_path, 
+    output_path,
+    use_h265=False, 
+):
+    """Check whether input files exist"""
+    for p in [video_path, bgm_path, voice_path, subtitle_path]:
+        if not Path(p).exists():
+            raise FileNotFoundError(f"{RED}File doesn't exist: {p}{RESET}")
+    
+    """Check whether output file exists, if exist then delete"""    
+    if os.path.isfile(output_path):
+        os.remove(output_path)
+
+    vcodec = "hevc_nvenc" if use_h265 == True else "h264_nvenc"
+    codingmethod = "H.265" if use_h265 == True else "H.264"
+    sub_safe = quote(subtitle_path)
+
+    """Check whether there are meaningless borders, if they exist, crop them"""
+    start = time.time()
+    logger.info(f"{GREEN}[CROP DETECT] elapsed: {time.time()-start:.2f}s")
+    crop_str = get_crop_filter(video_path)
+    if crop_str:
+        video_chain = f"[0:v]{crop_str},subtitles={sub_safe}[vout]"
+    else:
+        video_chain = f"[0:v]subtitles={sub_safe}[vout]"
+
+    filter_complex = (
+        f"[1:a]volume=0.4[bgm];"
+        f"[2:a]volume=1.0[voice];"
+        f"{video_chain};"
+        f"[bgm][voice]amix=inputs=2:duration=first[aout]"
+    )
+    if use_h265:
+        crf = 32  
+        preset = "slow"
+        extra_video_params = [
+            "-rc", "vbr_hq",        # 高质量VBR模式（比默认vbr更优）
+            "-cq", str(crf),        # NVENC的CQ对应CRF（恒定质量）
+            "-profile:v", "main10", # 10bit编码（色彩更准，压缩比更高）
+            "-spatial_aq", "1",     # 空间AQ开启
+            "-temporal_aq", "1",    # 时间AQ开启
+            "-bf", "4",             # 新增：启用B帧（硬件支持的话，提升压缩比）
+        ]
+    else:
+        crf = 28
+        preset = "medium"
+        extra_video_params = [
+            "-cq", str(crf),
+            "-profile:v", "main",
+        ]
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-hide_banner',      
+        '-loglevel', 'quiet',
+        '-stats',           
+        '-i', video_path,
+        '-i', bgm_path,
+        '-i', voice_path,
+        '-filter_complex', filter_complex,
+        '-map', '[vout]',
+        '-map', '[aout]',
+        '-c:v', vcodec,
+        '-preset', preset,
+        *extra_video_params,
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-ac', '2',
+        '-movflags', '+faststart', 
+        '-vsync', 'cfr',  # 强制恒定帧率，避免重复帧
+        '-flags', '+cgop',  # 关键帧间隔优化，提升压缩比
+        output_path
+    ]
+    total_start_time = time.time()
+
+    original_ld_preload = os.environ.get("LD_PRELOAD", "")
+    try:
+        os.environ["LD_PRELOAD"] = "/opt/libnvenc_fix.so"
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if result.stderr:
+            speed_values = []
+            for line in result.stderr.splitlines():
+                if 'speed=' in line:
+                    match = re.search(r'speed=([\d.]+)x', line)
+                    if match:
+                        speed_num = float(match.group(1))
+                        speed_values.append(speed_num)
+            if speed_values:
+                avg_speed = sum(speed_values) / len(speed_values)
+                logger.info(f"{GREEN}Video Saving Ratio = {avg_speed:.2f} using {codingmethod} {RESET}")            
+    finally:
+        if original_ld_preload:
+            os.environ["LD_PRELOAD"] = original_ld_preload
+        else:
+            os.environ.pop("LD_PRELOAD", None)
+    # result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"{RED}Merge Fail:\n{result.stderr}{RESET}")
+        allcmd = ' '.join(cmd)
+        print(allcmd)
+        flag = 0
+    else:
+        total_end_time = time.time()
+        hours,minutes,seconds,miliseconds = converttime(total_end_time - total_start_time)
+        logger.info(f"{GREEN}Video Saving Time is {hours} hours, {minutes} minutes, {seconds} seconds and {miliseconds} ms{RESET}")
+        if os.path.exists(output_path):
+            output_size = os.path.getsize(output_path) / (1024*1024)  # MB
+            logger.info(f"{GREEN}Output File Size: {output_size:.2f} MB ({codingmethod}, CRF={crf}){RESET}")
+        flag = 1
+    return flag
