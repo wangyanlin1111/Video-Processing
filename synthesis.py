@@ -187,16 +187,44 @@ class VoiceSynthesis:
                     """If calibration_factor is less than 1.25, then speed up the original synthesised vocal"""
                     """Else speed up 1.25x and advance the next few sentences 100ms each according to the time difference"""
                     calibration_factor = min(real_calibration_factor, 1.25)
-                    audio_np = audios[k].squeeze().cpu().to(th.float32).numpy()
-                    stretched_audio_np = pyrb.time_stretch(audio_np, self.SAMPLERATE, rate = calibration_factor)
-                    audios[k] = th.from_numpy(stretched_audio_np).to(self.DEVICE, self.DTYPE)
+                    #####################################################################################################
+                    # audio_np = audios[k].squeeze().cpu().to(th.float32).numpy()
+                    # stretched_audio_np = pyrb.time_stretch(audio_np, self.SAMPLERATE, rate = calibration_factor)
+                    # audios[k] = th.from_numpy(stretched_audio_np).to(self.DEVICE, self.DTYPE)
+                    #####################################################################################################
+                    speed = T.Speed(orig_freq=self.SAMPLERATE, factor=calibration_factor).to(self.DEVICE)
+                    stretched_audio, _ = speed(audios[k].float())
+                    audios[k] = stretched_audio
+                    #####################################################################################################
+                    # n_fft = 2048
+                    # win_length = 1536   
+                    # hop_length = 384       
+                    # spectrogram = T.Spectrogram(
+                    #     n_fft=n_fft,
+                    #     win_length=win_length,
+                    #     hop_length=hop_length,
+                    #     window_fn=th.hann_window
+                    # ).to(self.DEVICE)
+                    # transform = T.InverseSpectrogram(
+                    #     n_fft=n_fft,
+                    #     win_length=win_length,
+                    #     hop_length=hop_length,
+                    #     window_fn=th.hann_window
+                    # ).to(self.DEVICE)
+                    # stretch = T.TimeStretch(
+                    #     hop_length=hop_length,  
+                    #     n_freq=None
+                    # ).to(self.DEVICE)
+                    # original = spectrogram(audios[k])
+                    # stretched_spectrogram = stretch(original, calibration_factor)
+                    # stretched_audio = transform(stretched_spectrogram)
                     if (calibration_factor < real_calibration_factor):
-                        difference_samples = len(stretched_audio_np) - target_length[k]
+                        difference_samples = len(audios[k]) - target_length[k]
                         num_advance += int(difference_samples // Advance_SAMPLE)
                         advance_flag = 1
                     
                     if debug == 1:
-                        content = f"The {k+start_idx}th data, Calibration Factor = {calibration_factor}, Target = {target_length[k]}, Original = {current_length[k]}, Updated = {len(stretched_audio_np)}"+"\n"
+                        content = f"The {k+start_idx}th data, Calibration Factor = {calibration_factor}, Target = {target_length[k]}, Original = {current_length[k]}, Updated = {len(audios[k])}"+"\n"
                         file.write(content)
             for j in range(proc_num):
                 start_sample = round(total_sentences[index_mask[j]]["start"] * self.SAMPLERATE)
