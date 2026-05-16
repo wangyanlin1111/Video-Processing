@@ -16,7 +16,6 @@ import torchaudio
 
 import numpy as np
 import torch as th
-import torch.nn.functional as F
 import torchaudio.transforms as T
 
 from demucs.apply import apply_model
@@ -37,26 +36,6 @@ def _normalize_audio(tensor):
         tensor = tensor / max_val
     return tensor
 
-def crossfade_2d(signal_a, signal_b, fade_len_samples, fade_shape:str = None):
-    """
-    对两个信号（形状相同，可能是 [C, T]）的重叠部分进行交叉淡变
-    - signal_a: 前一段，取其最后 fade_len_samples 个样本
-    - signal_b: 后一段，取其前 fade_len_samples 个样本
-    返回混合后的重叠段
-    """
-    _fade_shape = fade_shape if fade_shape is not None else 'half_sine'
-    if fade_len_samples <= 0:
-        return signal_b[:, :fade_len_samples]
-    a_len = signal_a.shape[-1]
-    b_len = signal_b.shape[-1]
-    if a_len < fade_len_samples or b_len < fade_len_samples:
-        return signal_b[:, :min(fade_len_samples, b_len)]
-    head_transform = T.Fade(fade_in_len=fade_len_samples, fade_shape=_fade_shape)
-    tail_transform = T.Fade(fade_out_len=fade_len_samples, fade_shape=_fade_shape)
-    faded_a = tail_transform(signal_a[:, -fade_len_samples:])[:, -fade_len_samples:]
-    faded_b = head_transform(signal_b[:, :fade_len_samples])[:, :fade_len_samples]
-    return faded_a + faded_b
-
 class AudioSeparation:
 
     def __init__(self, segment_duration: int = None):
@@ -66,7 +45,6 @@ class AudioSeparation:
         init_start_time = time.time()
         self.DEVICE = "cuda" if th.cuda.is_available() else "cpu"
         self.MODEL_NAME = "mdx_extra"
-        self.MODEL = get_model(self.MODEL_NAME)
         self.OUT_VOCALS = "vocal_original.mp3"
         self.OUT_BG = "background.mp3"
         self.segment_duration = segment_duration * 60 if segment_duration is not None else 30 * 60  #Default length is 30 minutes
@@ -80,6 +58,8 @@ class AudioSeparation:
     def separate_long_audio(self, audio_path: str, output_bg: str, output_vocal: str = None):
 
         total_start_time = time.time()
+
+        self.MODEL = get_model(self.MODEL_NAME).to(self.DEVICE)
         """Acquire audio information"""
         info = torchaudio.info(audio_path)
         total_frames = info.num_frames
@@ -87,15 +67,11 @@ class AudioSeparation:
         self.total_duration = total_frames / orig_sr
         num_segments = int(np.ceil(self.total_duration / self.segment_duration))
 
-        """Create 3 queues"""
-        load_queue = queue.Queue(maxsize=2)      
-        process_queue = queue.Queue(maxsize=2)   
-        save_queue = queue.Queue(maxsize=2)      
+        """Create queues: loader→processor→saver pipeline"""
+        load_queue = queue.Queue(maxsize=2)      # Loader → Processor
+        process_queue = queue.Queue(maxsize=2)   # Processor → Saver
         
-        """Mark event"""
-        finish_event = threading.Event()
-        
-        """Start 3 queues"""
+        """Start 3 worker threads"""
         loader = threading.Thread(
             target=self._loader_worker,
             args=(audio_path, orig_sr, num_segments, load_queue)
@@ -140,7 +116,9 @@ class AudioSeparation:
         load_queue.put(None)
     
     def _processor_worker(self, load_queue, original_sr, process_queue):
-        
+        # Runs on GPU - processes audio segments
+        # Only one _processor_worker exists, so GPU is naturally protected
+        # from running multiple files' processing simultaneously
         while True:
             item = load_queue.get()
             if item is None:
@@ -148,10 +126,10 @@ class AudioSeparation:
                 break
                 
             seg_idx, wav, valid_start, valid_end = item
-            wav = convert_audio(wav.to(self.DEVICE), original_sr, self.MODEL.samplerate, self.MODEL.audio_channels)
-            wav = wav.unsqueeze(0)
+            # Convert audio on CPU first, then move to GPU (safer)
+            wav = convert_audio(wav, original_sr, self.MODEL.samplerate, self.MODEL.audio_channels)
+            wav = wav.unsqueeze(0).to(self.DEVICE)
             
-            # 执行分离
             with th.no_grad():
                 sources = apply_model(
                     self.MODEL, 
@@ -159,92 +137,104 @@ class AudioSeparation:
                     shifts=0, 
                     split=True, 
                     overlap=0.25,
-                    progress = False
+                    progress=False
                 )[0]
                         
-            # 立即释放GPU内存
             drums, bass, other, vocal = sources
             bg = drums + bass + other
             vocal = _normalize_audio(vocal)
             bg = _normalize_audio(bg)
             
-            # 保存结果（移回CPU）
             vocal_cpu = vocal.detach().cpu()
             bg_cpu = bg.detach().cpu()
             process_queue.put((seg_idx, vocal_cpu, bg_cpu, valid_start, valid_end))
             
-            # 清理
             del wav, sources, drums, bass, other, vocal, bg
             if self.DEVICE == "cuda":
                 th.cuda.empty_cache()
 
-    def _saver_worker(
-            self, 
-            process_queue, 
-            output_bg, 
-            output_vocal
-        ): 
-        vocal_parts = []
-        bg_parts = []
+    def _saver_worker(self, process_queue, output_bg, output_vocal):
+        # Runs on CPU - saves and crossfades segments
+        accumulated_vocal = None
+        accumulated_bg = None
         first_seg = True
-        vocal, bg = None, None
 
         while True:
             item = process_queue.get()
             if item is None:
                 break
-            _, vocal, bg, valid_start, valid_end = item  
 
-            load_start = valid_start - self.overlapsecond
+            _, vocal, bg, valid_start, valid_end = item
 
             if first_seg:
-                # 第一段直接保存
-                vocal_parts.append(vocal)
-                bg_parts.append(bg)
+                # 第一段直接保存（包含尾部重叠部分，用于后续交叉淡变）
+                accumulated_vocal = vocal
+                accumulated_bg = bg
                 first_seg = False
             else:
-                # 与前一段重叠部分做交叉淡变
-                # 假设 vocal 和 prev_vocal 的形状一致，前一段已经保存在 vocal_parts[-1] 中
-                prev_vocal = vocal_parts[-1]
-                prev_bg = bg_parts[-1]
-                overlap_samples = self.MODEL.samplerate * self.overlapsecond
-                overlap_len = min(overlap_samples, prev_vocal.shape[1], vocal.shape[1])
-                if overlap_len <= 0:
-                    # 无重叠，直接拼接
-                    new_vocal = th.cat([prev_vocal, vocal], dim=-1)
-                    new_bg = th.cat([prev_bg, bg], dim=-1)
+                # 与前一段的重叠部分做交叉淡变（渐进式合并）
+                # 相邻两段实际重叠为 2 * overlapsecond 秒
+                samplerate = self.MODEL.samplerate
+                overlap_samples = int(self.overlapsecond * samplerate)
+                crossfade_len = 2 * overlap_samples  # 实际重叠长度
+
+                # 确保有足够的样本做淡变
+                actual_len = min(crossfade_len, accumulated_vocal.shape[-1], vocal.shape[-1])
+
+                if actual_len > 0:
+                    # 对累积音频尾部做淡出
+                    fade_out = T.Fade(fade_out_len=actual_len, fade_shape='half_sine')
+                    faded_tail_vocal = fade_out(accumulated_vocal[:, -actual_len:])
+                    faded_tail_bg = fade_out(accumulated_bg[:, -actual_len:])
+
+                    # 对当前段头部做淡入
+                    fade_in = T.Fade(fade_in_len=actual_len, fade_shape='half_sine')
+                    faded_head_vocal = fade_in(vocal[:, :actual_len])
+                    faded_head_bg = fade_in(bg[:, :actual_len])
+
+                    # 交叉淡变后的重叠区
+                    crossfaded_vocal = faded_tail_vocal + faded_head_vocal
+                    crossfaded_bg = faded_tail_bg + faded_head_bg
+
+                    # 拼接：非重叠尾部 + 交叉淡变区 + 非重叠头部
+                    accumulated_vocal = th.cat([
+                        accumulated_vocal[:, :-actual_len],
+                        crossfaded_vocal,
+                        vocal[:, actual_len:]
+                    ], dim=-1)
+                    accumulated_bg = th.cat([
+                        accumulated_bg[:, :-actual_len],
+                        crossfaded_bg,
+                        bg[:, actual_len:]
+                    ], dim=-1)
                 else:
-                    # 交叉淡变重叠区
-                    vocal_overlap = crossfade_2d(prev_vocal, vocal, overlap_len, fade_shape='half_sine')
-                    bg_overlap = crossfade_2d(prev_bg, bg, overlap_len, fade_shape='half_sine')
-                    # 更新前一段：去掉原来的重叠尾部，加上新的重叠区
-                    new_vocal = th.cat([
-                        prev_vocal[:, :-2*overlap_len],
-                        vocal_overlap,
-                        vocal[:, 2*overlap_len:]
-                    ], dim=-1)
-                    new_bg = th.cat([
-                        prev_bg[:, :-2*overlap_len],
-                        bg_overlap,
-                        bg[:, 2*overlap_len:]
-                    ], dim=-1)
-                    # 替换最后一段为新的完整段
-                    vocal_parts[-1] = new_vocal
-                    bg_parts[-1] = new_bg
-                del prev_vocal, prev_bg, vocal, bg  # 释放前序张量
+                    # 无重叠，直接拼接
+                    accumulated_vocal = th.cat([accumulated_vocal, vocal], dim=-1)
+                    accumulated_bg = th.cat([accumulated_bg, bg], dim=-1)
+
+                # 释放当前段张量
+                del vocal, bg
                 gc.collect()
 
-        # 最终所有段已经拼接在 vocal_parts[0] 中（因为我们是渐进式更新）
-        final_vocal = vocal_parts[0] if vocal_parts else None
-        final_bg = bg_parts[0] if bg_parts else None
+        if accumulated_vocal is None or accumulated_bg is None:
+            logger.warning("No audio data to save!")
+            return
+
+        # 裁剪末尾多出的 overlap 部分（最后一段的尾部重叠）
+        trim_samples = int(self.overlapsecond * self.MODEL.samplerate)
+        if accumulated_vocal.shape[-1] > trim_samples:
+            accumulated_vocal = accumulated_vocal[:, :-trim_samples]
+            accumulated_bg = accumulated_bg[:, :-trim_samples]
+
         # 保存
         if output_bg is not None:
             if os.path.isfile(output_bg):
                 os.remove(output_bg)
-            torchaudio.save(output_bg, final_bg.cpu(), self.MODEL.samplerate)
-        if output_vocal is not None:    
+            torchaudio.save(output_bg, accumulated_bg, samplerate)
+        if output_vocal is not None:
             if os.path.isfile(output_vocal):
-                os.remove(output_vocal)    
-            torchaudio.save(output_vocal, final_vocal.cpu(), self.MODEL.samplerate)
-        del final_vocal, final_bg
+                os.remove(output_vocal)
+            torchaudio.save(output_vocal, accumulated_vocal, samplerate)
+
+        del accumulated_vocal, accumulated_bg
         gc.collect()
