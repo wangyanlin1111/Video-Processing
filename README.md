@@ -45,8 +45,11 @@
 ### 安装依赖库
 `pip install torch==2.10.0 torchaudio==2.10.0 torchcodec==0.10.0 torchvision==0.25.0 transformers`
 `pip qwen_tts demucs faster_whisper pyrubberband huggingface_hub pymediainfo pydub`
-`conda install -c conda-forge ffmpeg mkl=2021.4.0 -y`
+`conda install -c conda-forge ffmpeg mkl=2021.4.0 libstdcxx-ng -y`
 `conda install numpy tqdm -y`
+如果运行代码报bug'ImportError: /usr/lib/x86_64-linux-gnu/libstdc++.so.6: version `CXXABI_1.3.15' not found',则分别运行：
+`echo 'export LD_LIBRARY_PATH=/root/miniconda3/envs/video_proc/lib:$LD_LIBRARY_PATH' >> ~/.bashrc`
+`source ~/.bashrc`
 
 **由于代码中模型的注意力使用了 `attn_implementation = flash_attention_2`，需要安装flash-attn，而这个库cuda版本号和pytorch版本等强相关，因此可参考(https://github.com/Dao-AILab/flash-attention)选择合适自己的版本，在此不再赘述。**
 
@@ -137,3 +140,5 @@ NVIDIA NVENC 编码器在底层硬编码了一个错误的假设：NVENC 不是�
 输入：`:set ff=unix`(修改为 Linux 格式)
 继续输入：`:wq`(保存并退出 Vim)
 
+### HY-MT1.5-1.8B和/Qwen3-TTS-12Hz-1.7B模型加载方式
+如果不使用本地模型，可以将`video_proc.py`中的model_path、gen_model_path和syn_model_path删去，或改为自己的本地存储路径。

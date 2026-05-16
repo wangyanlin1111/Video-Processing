@@ -13,10 +13,13 @@ if __name__ == '__main__':
         operation_path = sys.argv[1]
     else:
         operation_path = "../videos"
+    if len(sys.argv) > 2:
+        debug_en = sys.argv[2].lower() in ('true', '1', 'yes')
+    else:
+        debug_en = False 
     try:
         video_proc = VideoProc(
-            debug_en = 0, 
-            vocal_save_flag = True, 
+            debug_en = debug_en, 
             sentence_len_in_second = 7, 
             translation_mode = 0, 
             synthesis_batch_size = 15, 

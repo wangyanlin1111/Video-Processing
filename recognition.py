@@ -1,5 +1,6 @@
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import logging
 import time
@@ -10,7 +11,7 @@ import numpy as np
 import torch as th
 import torchaudio.transforms as T
 from faster_whisper import WhisperModel
-from commonfunc import converttime
+from commonfunc import converttime, get_error_detail
 
 WHISPER_SAMPLE_RATE = 16000
 QWENTSS_SAMPLE_RATE = 24000
@@ -245,7 +246,7 @@ class Recognition:
             english_sentences, _ = self.process_segments_to_final_subtitles(segments_list)
 
             """Save debug info"""
-            if debug_en == 1:
+            if debug_en == True:
                 with open(r"EnglishContent_origin.txt", "w", encoding="utf-8") as f0:
                     for i, segment in enumerate(segments_list):
                         f0.write(f"{i}\n")
@@ -271,6 +272,7 @@ class Recognition:
             return english_sentences
         except Exception as e:
             """Throw Exception"""
-            logger.error(f"Recognition/translation failed: {e}")
+            error_detail = get_error_detail(e)
+            logger.error(f"{RED}{error_detail}{RESET}")
             raise
 

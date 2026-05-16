@@ -21,6 +21,7 @@ YELLOW = "\033[93m"
 BLUE = "\033[94m"  
 PUPPLE = "\033[95m"  
 RESET = "\033[0m"
+subtitle_font_config=":fontsdir=/usr/share/fonts/opentype/noto:force_style='FontName=Noto Sans CJK SC,FontSize=18'"
 
 def get_crop_filter(video_path):
     try:
@@ -36,6 +37,18 @@ def get_crop_filter(video_path):
     except:
         pass
     return ""
+
+def get_video_width_after_crop(video_path, crop_str):
+    """Acquire video width after crop"""
+    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', 
+           '-show_entries', 'stream=width', '-of', 'default=noprint_wrappers=1:nokey=1', video_path]
+    original_width = int(subprocess.run(cmd, capture_output=True, text=True).stdout.strip())
+    
+    if crop_str:
+        match = re.search(r'crop=(\d+):', crop_str)
+        if match:
+            return int(match.group(1))
+    return original_width
 
 def compose_video(
     video_path, 
@@ -59,14 +72,16 @@ def compose_video(
     sub_safe = quote(subtitle_path)
 
     """Check whether there are meaningless borders, if they exist, crop them"""
-    start = time.time()
-    logger.info(f"{GREEN}[CROP DETECT] elapsed: {time.time()-start:.2f}s")
     crop_str = get_crop_filter(video_path)
     if crop_str:
-        video_chain = f"[0:v]{crop_str},subtitles={sub_safe}[vout]"
+        width = get_video_width_after_crop(video_path, crop_str)
+        max_width = int(width * 0.8)  
+        subtitle_font_config = f":fontsdir=/usr/share/fonts/opentype/noto:force_style='FontName=Noto Sans CJK SC,FontSize=16,MarginL=20,MarginR=20,Alignment=2,MaxWrapWidth={max_width}'"
+        video_chain = f"[0:v]{crop_str},subtitles={sub_safe}{subtitle_font_config}[vout]"
     else:
-        video_chain = f"[0:v]subtitles={sub_safe}[vout]"
-
+        subtitle_font_config = ":fontsdir=/usr/share/fonts/opentype/noto:force_style='FontName=Noto Sans CJK SC,FontSize=16,MarginL=20,MarginR=20,Alignment=2'"
+        video_chain = f"[0:v]subtitles={sub_safe}{subtitle_font_config}[vout]"
+        
     filter_complex = (
         f"[1:a]volume=0.4[bgm];"
         f"[2:a]volume=1.0[voice];"

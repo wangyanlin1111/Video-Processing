@@ -1,5 +1,6 @@
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import logging
 logging.basicConfig(
@@ -17,7 +18,7 @@ import torchaudio
 from demucs.apply import apply_model
 from demucs.audio import convert_audio
 from demucs.pretrained import get_model
-from commonfunc import converttime
+from commonfunc import converttime, get_error_detail
 
 RED = "\033[91m"    
 GREEN = "\033[92m"  
@@ -85,7 +86,7 @@ class AudioSeparation:
                 shifts = 0,
                 split = True,
                 overlap = 0.25,
-                progress = False
+                progress = self.SAVE_FLAG
             )[0]
         drums, bass, other, vocal = sources
         background = drums + bass + other

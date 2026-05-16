@@ -2,7 +2,8 @@
 # import requests
 # import json
 import os
-# Disable all redudant info
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -47,7 +48,7 @@ import time
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from commonfunc import converttime
 
-MODEL_NAME = "/root/autodl-tmp/local_model/Tencent-Hunyuan_HY-MT1.5-1.8B"
+MODEL_NAME ="tencent/HY-MT1.5-1.8B"
 
 RED = "\033[91m"    
 GREEN = "\033[92m"  
@@ -121,9 +122,10 @@ class SubscriptTranslation:
     """
     option 0: Transformer; 1: Ollama; 2: vllm
     """
-    def __init__(self, option : int = None, gpu_memory_utilization: float = None):
+    def __init__(self, option : int = None, model_path: str = None, gpu_memory_utilization: float = None):
         self.OPTION = option if option is not None else 0
         self.DEVICE = "cuda" if th.cuda.is_available() else "cpu"
+        self.MODEL_NAME = model_path if model_path is not None else MODEL_NAME
         init_start_time = time.time()
         if self.OPTION == 0:
             try:
@@ -138,7 +140,6 @@ class SubscriptTranslation:
                 if self.DEVICE == "cuda":
                     free, total = th.cuda.mem_get_info()
                     logger.info(f"{YELLOW}Subscript Translation via Transformer: All: {total / 1024 ** 3:.2f} GB, Free: {free / 1024 ** 3:.2f} GB{RESET}")
-                    self.occupied_mem =  (total - free) / 1024 ** 3 
             except Exception as e:
                 """Throw Exception"""
                 logger.error(f"{RED}Failed to initialize Transformer service: {e}{RESET}")
@@ -157,7 +158,6 @@ class SubscriptTranslation:
                     MODEL_NAME, 
                     trust_remote_code=True
                 )
-    
                 self.llm = LLM(
                     model=MODEL_NAME,
                     disable_log_stats=True,
@@ -175,13 +175,17 @@ class SubscriptTranslation:
                 if th.cuda.is_available():
                     free, total = th.cuda.mem_get_info()
                     logger.info(f"{YELLOW}Subscript Translation via vllm: All: {total / 1024 ** 3:.2f} GB, Free: {free / 1024 ** 3:.2f} GB{RESET}")
-                    self.occupied_mem =  (total - free) / 1024 ** 3 
             except Exception as e:
                 """Throw Exception"""
                 logger.error(f"{RED}Failed to initialize vllm service: {e}{RESET}")
                 raise
         init_end_time = time.time()
         logger.info(f"{GREEN}Subscript Translation Init Time: {init_end_time - init_start_time:.4f}s{RESET}")
+        translate_method = "transform" if self.OPTION == 0 else "vllm"
+        if th.cuda.is_available():
+            free, total = th.cuda.mem_get_info()
+            logger.info(f"{YELLOW}Subscript Translation via {translate_method}: All: {total / 1024 ** 3:.2f} GB, Free: {free / 1024 ** 3:.2f} GB{RESET}")
+        
 
     def translate_via_vllm(self, english_sentences) -> list[str]:
         """

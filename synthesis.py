@@ -2,6 +2,8 @@ from huggingface_hub.utils import disable_progress_bars
 disable_progress_bars()
 
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
@@ -33,7 +35,7 @@ import torchaudio.transforms as T
 import pyrubberband as pyrb
 
 from qwen_tts import Qwen3TTSModel
-from commonfunc import converttime
+from commonfunc import converttime, get_error_detail
 
 RED = "\033[91m"    
 GREEN = "\033[92m"  
@@ -49,21 +51,25 @@ default_text = "我们的星球已经经历了数十亿年的各种灾难性事�
 default_language = "Chinese"
 
 class VoiceSynthesis:
-    def __init__(self, batchsize: int = None, instruction: str = None):
-        default_instruction = instruction if instruction is not None else "35岁男性, 播音腔, 颗粒感强, 语速很快，句子间间隔短"
+    def __init__(self, batchsize: int = None, gen_model_path: str = None, syn_model_path: str = None, instruction: str = None):
+        default_instruction = instruction if instruction is not None else "45岁男性, 低沉而有磁性, 颗粒感强, 语速非常快，句子间间隔短"
         init_start_time = time.time()
         self.VOCALPATH = "vocal_clone.mp3"
         self.BATCHSIZE = batchsize if batchsize is not None else 10
         self.REFINSTRUCTION = default_instruction
         self.DEVICE = "cuda" if th.cuda.is_available() else "cpu"
         self.DTYPE = th.bfloat16 if self.DEVICE == "cuda" else th.float32
-        self.MODELNAME = "Qwen/Qwen3-TTS-12Hz-1.7B-Base" if self.DEVICE == "cuda" else "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+        if syn_model_path is not None:
+            self.MODELNAME = syn_model_path 
+        else:
+            self.MODELNAME = "Qwen/Qwen3-TTS-12Hz-1.7B-Base" if self.DEVICE == "cuda" else "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+        _gen_model_name_path = gen_model_path if gen_model_path is not None else "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
         self.ATTENTION = "flash_attention_2" if self.DEVICE == "cuda" else "eager"
         self.SAMPLERATE = Qwen3TTSModel_SAMPLE_RATE
         self.calibrationsampler = T.Resample(orig_freq=self.SAMPLERATE, new_freq=self.SAMPLERATE).to(self.DEVICE)
         """First Design the reference audio for voice clone"""
         design_model = Qwen3TTSModel.from_pretrained(
-            "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+            _gen_model_name_path,
             device_map = self.DEVICE,
             dtype = self.DTYPE,
             attn_implementation = self.ATTENTION,
@@ -117,40 +123,53 @@ class VoiceSynthesis:
 
     @th.no_grad()
     def synthesize_single(self, text, speed=1.0):
-        with th.no_grad():
-            wav, _ = self.SYNTHESISMODEL.generate_voice_clone(
-                text=text, 
-                language="Chinese",
-                voice_clone_prompt=self.VOICECLONEPROMPT, 
-                speed=speed
-            )
-        return th.from_numpy(wav[0]).squeeze().to(self.DEVICE, self.DTYPE)
+        try:
+            with th.no_grad():
+                wav, _ = self.SYNTHESISMODEL.generate_voice_clone(
+                    text=text, 
+                    language="Chinese",
+                    voice_clone_prompt=self.VOICECLONEPROMPT, 
+                    speed=speed
+                )
+                if th.cuda.is_available():
+                    th.cuda.empty_cache()
+            return th.from_numpy(wav[0]).squeeze().to(self.DEVICE, self.DTYPE)
+        except Exception as e:
+            error_detail = get_error_detail(e)
+            logger.error(f"{RED}{error_detail}{RESET}")
+            raise RuntimeError(f"Single generation failed")
     
     @th.no_grad()
     def synthesize_batch(self, texts, speed=1.0):
         audios = []
-        with th.no_grad():
-            wavs, _ = self.SYNTHESISMODEL.generate_voice_clone(
-                text=texts,
-                language="Chinese",
-                voice_clone_prompt = self.VOICECLONEPROMPT,
-                speed=speed
-            )
-            for w in wavs:
-                audio = th.from_numpy(w).to(self.DEVICE, self.DTYPE)
-                audios.append(audio)
-            del wavs
-        return audios
-    
-    def synthesize(self, total_sentences, sampling_rate, ori_len, ori_sr, debug = 0, vocal_path:str=None):
+        try:
+            with th.no_grad():
+                wavs, _ = self.SYNTHESISMODEL.generate_voice_clone(
+                    text=texts,
+                    language="Chinese",
+                    voice_clone_prompt = self.VOICECLONEPROMPT,
+                    speed=speed
+                )
+                for w in wavs:
+                    audio = th.from_numpy(w).to(self.DEVICE, self.DTYPE)
+                    audios.append(audio)
+                del wavs
+                if th.cuda.is_available():
+                    th.cuda.empty_cache()
+                return audios
+        except Exception as e:
+            error_detail = get_error_detail(e)
+            logger.error(f"{RED}{error_detail}{RESET}")
+            raise RuntimeError(f"Batch generation failed")
+            
+    def synthesize(self, total_sentences, sampling_rate, ori_len, ori_sr, debug_en:bool=False, vocal_path:str=None):
 
         total_start_time = time.time()
-
         full_audio = th.tensor([], dtype = self.DTYPE, device = self.DEVICE)
         prev_end_sample = 0
         N = len(total_sentences)
         iteration_num = math.ceil(N / self.BATCHSIZE)
-        if debug == 1:
+        if debug_en == True:
             file = open('regeneration_log.txt', 'w')
         num_advance = 0
         advance_flag = 0
@@ -160,12 +179,12 @@ class VoiceSynthesis:
             proc_num = end_idx - start_idx
             index_mask = np.arange(start_idx, end_idx)
             texts = [total_sentences[j]["chinese"].strip() for j in index_mask]
-            audios = self.synthesize_batch(texts)
+            audios = self.synthesize_batch(texts, speed=1.2)
             current_length = np.array([len(audio) for audio in audios])
             target_length = []
             for j in index_mask:
                 real_duration = total_sentences[j]["end"] - total_sentences[j]["start"]
-                correction_term = (total_sentences[j+1]["start"] - total_sentences[j]["end"]) * 0.7 if j != (N - 1) else 0
+                correction_term = (total_sentences[j+1]["start"] - total_sentences[j]["end"]) * 0.85 if j != (N - 1) else 0
                 target_length.append(round((real_duration + correction_term) * self.SAMPLERATE))
             target_length = np.array(target_length)
             regenerate_flag = current_length > target_length
@@ -173,59 +192,21 @@ class VoiceSynthesis:
             if len(calibration_mask) > 0:
                 for k in calibration_mask:
                     real_calibration_factor = math.ceil(current_length[k] / target_length[k] * 100) / 100
-                    # """If calibration_factor is less than 1.25, then speed up the original synthesised vocal"""
-                    # """Else keep the original synthesised vocal and advance the next few sentences 100ms each according to the time difference"""
-                    # if calibration_factor < 1.25:
-                    #     speed = torchaudio.transforms.Speed(orig_freq=self.SAMPLERATE, factor=calibration_factor).to(self.DEVICE)
-                    #     stretched_audio, _ = speed(audios[k].float())
-                    #     stretched_audio = self.calibrationsampler(stretched_audio.float())
-                    #     audios[k] = stretched_audio
-                    # else:
-                    #     difference_samples = current_length[k] - target_length[k]
-                    #     num_advance += int(difference_samples // Advance_SAMPLE)
-                    #     advance_flag = 1
-                    """If calibration_factor is less than 1.25, then speed up the original synthesised vocal"""
+                    """If calibration_factor is less than 1.15, then speed up the original synthesised vocal"""
                     """Else speed up 1.25x and advance the next few sentences 100ms each according to the time difference"""
-                    calibration_factor = min(real_calibration_factor, 1.25)
-                    #####################################################################################################
-                    # audio_np = audios[k].squeeze().cpu().to(th.float32).numpy()
-                    # stretched_audio_np = pyrb.time_stretch(audio_np, self.SAMPLERATE, rate = calibration_factor)
-                    # audios[k] = th.from_numpy(stretched_audio_np).to(self.DEVICE, self.DTYPE)
-                    #####################################################################################################
-                    speed = T.Speed(orig_freq=self.SAMPLERATE, factor=calibration_factor).to(self.DEVICE)
-                    stretched_audio, _ = speed(audios[k].float())
-                    audios[k] = stretched_audio
-                    #####################################################################################################
-                    # n_fft = 2048
-                    # win_length = 1536   
-                    # hop_length = 384       
-                    # spectrogram = T.Spectrogram(
-                    #     n_fft=n_fft,
-                    #     win_length=win_length,
-                    #     hop_length=hop_length,
-                    #     window_fn=th.hann_window
-                    # ).to(self.DEVICE)
-                    # transform = T.InverseSpectrogram(
-                    #     n_fft=n_fft,
-                    #     win_length=win_length,
-                    #     hop_length=hop_length,
-                    #     window_fn=th.hann_window
-                    # ).to(self.DEVICE)
-                    # stretch = T.TimeStretch(
-                    #     hop_length=hop_length,  
-                    #     n_freq=None
-                    # ).to(self.DEVICE)
-                    # original = spectrogram(audios[k])
-                    # stretched_spectrogram = stretch(original, calibration_factor)
-                    # stretched_audio = transform(stretched_spectrogram)
+                    calibration_factor = min(real_calibration_factor, 1.15)
+                    audio_np = audios[k].squeeze().cpu().to(th.float32).numpy()
+                    stretched_audio_np = pyrb.time_stretch(audio_np, self.SAMPLERATE, rate = calibration_factor)
+                    audios[k] = th.from_numpy(stretched_audio_np).to(self.DEVICE, self.DTYPE)
                     if (calibration_factor < real_calibration_factor):
                         difference_samples = len(audios[k]) - target_length[k]
                         num_advance += int(difference_samples // Advance_SAMPLE)
                         advance_flag = 1
                     
-                    if debug == 1:
+                    if debug_en == True:
                         content = f"The {k+start_idx}th data, Calibration Factor = {calibration_factor}, Target = {target_length[k]}, Original = {current_length[k]}, Updated = {len(audios[k])}"+"\n"
                         file.write(content)
+            ###################################################################################################
             for j in range(proc_num):
                 start_sample = round(total_sentences[index_mask[j]]["start"] * self.SAMPLERATE)
                 silence_samples = max(start_sample - prev_end_sample, 0)
@@ -245,7 +226,8 @@ class VoiceSynthesis:
                 gc.collect()
                 th.cuda.empty_cache()
                 th.cuda.synchronize()
-        
+        if debug_en == True:
+            file.close()
         if sampling_rate != self.SAMPLERATE:
             resampler = self.get_resampler(target_freq = sampling_rate)
             audio = resampler(full_audio.float())

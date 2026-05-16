@@ -7,6 +7,7 @@ import multiprocessing
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 os.environ["OMP_NUM_THREADS"] = str(multiprocessing.cpu_count())
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import logging
 logging.basicConfig(
@@ -121,13 +122,12 @@ class VideoProc:
 
     def __init__(
             self, 
-            debug_en = 0,                   # Debug Mode
-            vocal_save_flag = False,        # Whether save original vocal
+            debug_en = False,               # Debug Mode
             sentence_len_in_second = 7.0,   # Threshold of sentence segmentation
             translation_mode = 0,           # 0:Transformer; 1:ollama(not execuated); 2:vllm(code completed, no header included)
             synthesis_batch_size = 10,      # Batch size of vocal synthesis
             operation_path = './',          # Path of video and audio
-            h256flag = False,               # H.265 coding protocl
+            h256flag = True,               # H.265 coding protocl
             max_cpu_queue_size = 5          # Maximum number of cpu work to be processed
         ):
 
@@ -136,7 +136,7 @@ class VideoProc:
         self.h256flag = h256flag
         self.max_cpu_queue_size = max_cpu_queue_size
 
-        self.separator = AudioSeparation(save_flag = vocal_save_flag)
+        self.separator = AudioSeparation(save_flag = debug_en)
         self.recognition = Recognition(max_duration = sentence_len_in_second)
         self.translation = SubscriptTranslation(option = translation_mode)
         self.synthesis = VoiceSynthesis(batchsize = synthesis_batch_size)
@@ -169,7 +169,7 @@ class VideoProc:
             vocals, sr, ori_len, ori_sr = self.separator.audio_separate(audio_path = audio_name, bgm_path = bgm_name, vocal_path = vocal_ori_name)
             english_sentences = self.recognition.recognition(vocals, sr, self.debug_en)
             total_sentences = self.translation.Subscript_Translation_Srt_Generation(english_sentences, subtitle_name)
-            self.synthesis.synthesize(total_sentences, sr, ori_len, ori_sr, debug = self.debug_en, vocal_path = vocal_clone_name)
+            self.synthesis.synthesize(total_sentences, sr, ori_len, ori_sr, debug_en = self.debug_en, vocal_path = vocal_clone_name)
             job_end = time.time()
             elapse_time = job_end - job_start
 
@@ -212,7 +212,9 @@ class VideoProc:
                 output_path=preprocess_result["merge_name"],
                 use_h265=self.h256flag
             )
-            if flag == 1:
+
+            """If not in debug mode after sucessful merging video files, temp files should be removed"""
+            if flag == 1 and self.debug_en == False:
                 video_name = preprocess_result.get("video_name")
                 audio_name = preprocess_result.get("audio_name")
                 bgm_name = preprocess_result.get("bgm_name")

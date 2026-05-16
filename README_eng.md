@@ -45,8 +45,11 @@ It is recommended to use Conda to create an independent runtime environment for 
 ### Install Dependencies
 `pip install torch==2.10.0 torchaudio==2.10.0 torchcodec==0.10.0 torchvision==0.25.0 transformers`
 `pip qwen_tts demucs faster_whisper pyrubberband huggingface_hub pymediainfo pydub`
-`conda install -c conda-forge ffmpeg mkl=2021.4.0 -y`
+`conda install -c conda-forge ffmpeg mkl=2021.4.0 libstdcxx-ng -y`
 `conda install numpy tqdm -y`
+Execuate the following two lines if you encounter issues like 'ImportError: /usr/lib/x86_64-linux-gnu/libstdc++.so.6: version `CXXABI_1.3.15' not found':
+`echo 'export LD_LIBRARY_PATH=/root/miniconda3/envs/video_proc/lib:$LD_LIBRARY_PATH' >> ~/.bashrc`
+`source ~/.bashrc`
 
 **Since the model's attention in the code uses attn_implementation = flash_attention_2, it is necessary to install flash-attn. This library is strongly related to the CUDA version number and PyTorch version, so you can refer to (https://github.com/Dao-AILab/flash-attention) to select the version suitable for you, which will not be stated here.**
 
@@ -141,3 +144,5 @@ Open the script with Vim, enter the directory where `run.sh` is located in the t
 Enter: `:set ff=unix`(modify to Linux format)
 Continue to enter:`:wq`(save and exit Vim)
 
+### Model loading method for HY-MT1.5-1.8B and Qwen3-TTS-12Hz-1.7B 
+If you don't use local model, you can delete these thress variables `model_path、gen_model_path and syn_model_path` in `video_proc.py` or you can replace it with your own local path.
