@@ -222,10 +222,10 @@ class VoiceSynthesis:
 
             """Empty Cache"""
             del audios
+            gc.collect()
             if self.DEVICE == "cuda":
-                gc.collect()
                 th.cuda.empty_cache()
-                th.cuda.synchronize()
+                # th.cuda.synchronize()
         if debug_en == True:
             file.close()
         if sampling_rate != self.SAMPLERATE:

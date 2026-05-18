@@ -137,9 +137,6 @@ class SubscriptTranslation:
                     attn_implementation="flash_attention_2",
                     device_map=self.DEVICE
                 )
-                if self.DEVICE == "cuda":
-                    free, total = th.cuda.mem_get_info()
-                    logger.info(f"{YELLOW}Subscript Translation via Transformer: All: {total / 1024 ** 3:.2f} GB, Free: {free / 1024 ** 3:.2f} GB{RESET}")
             except Exception as e:
                 """Throw Exception"""
                 logger.error(f"{RED}Failed to initialize Transformer service: {e}{RESET}")
@@ -172,16 +169,13 @@ class SubscriptTranslation:
                     kv_cache_dtype="fp8",
                     quantization=None,
                 )
-                if th.cuda.is_available():
-                    free, total = th.cuda.mem_get_info()
-                    logger.info(f"{YELLOW}Subscript Translation via vllm: All: {total / 1024 ** 3:.2f} GB, Free: {free / 1024 ** 3:.2f} GB{RESET}")
             except Exception as e:
                 """Throw Exception"""
                 logger.error(f"{RED}Failed to initialize vllm service: {e}{RESET}")
                 raise
         init_end_time = time.time()
         logger.info(f"{GREEN}Subscript Translation Init Time: {init_end_time - init_start_time:.4f}s{RESET}")
-        translate_method = "transform" if self.OPTION == 0 else "vllm"
+        translate_method = "transformer" if self.OPTION == 0 else "vllm"
         if th.cuda.is_available():
             free, total = th.cuda.mem_get_info()
             logger.info(f"{YELLOW}Subscript Translation via {translate_method}: All: {total / 1024 ** 3:.2f} GB, Free: {free / 1024 ** 3:.2f} GB{RESET}")

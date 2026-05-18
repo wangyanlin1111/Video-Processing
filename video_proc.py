@@ -24,7 +24,8 @@ from pymediainfo import MediaInfo
 from pydub.utils import mediainfo
 from concurrent.futures import ThreadPoolExecutor, Future
 
-from separation import AudioSeparation
+# from separation import AudioSeparation
+from asyncseparator import AsyncAudioSeparation
 from recognition import Recognition
 from translation import SubscriptTranslation
 from synthesis import VoiceSynthesis
@@ -123,6 +124,7 @@ class VideoProc:
     def __init__(
             self, 
             debug_en = False,               # Debug Mode
+            audio_segment_duration = 60,    # Large Audio Segment Duration for Async Separation, in seconds
             sentence_len_in_second = 7.0,   # Threshold of sentence segmentation
             translation_mode = 0,           # 0:Transformer; 1:ollama(not execuated); 2:vllm(code completed, no header included)
             synthesis_batch_size = 10,      # Batch size of vocal synthesis
@@ -136,7 +138,8 @@ class VideoProc:
         self.h256flag = h256flag
         self.max_cpu_queue_size = max_cpu_queue_size
 
-        self.separator = AudioSeparation(save_flag = debug_en)
+        # self.separator = AudioSeparation(save_flag = debug_en)
+        self.asyncseparator = AsyncAudioSeparation(segment_duration = audio_segment_duration)
         self.recognition = Recognition(max_duration = sentence_len_in_second)
         self.translation = SubscriptTranslation(option = translation_mode)
         self.synthesis = VoiceSynthesis(batchsize = synthesis_batch_size)
@@ -166,10 +169,23 @@ class VideoProc:
             subtitle_name = os.path.join(sub_file_name, f"{clean_stem}_subscript.srt")
 
             """Start Processing"""
-            vocals, sr, ori_len, ori_sr = self.separator.audio_separate(audio_path = audio_name, bgm_path = bgm_name, vocal_path = vocal_ori_name)
-            english_sentences = self.recognition.recognition(vocals, sr, self.debug_en)
-            total_sentences = self.translation.Subscript_Translation_Srt_Generation(english_sentences, subtitle_name)
-            self.synthesis.synthesize(total_sentences, sr, ori_len, ori_sr, debug_en = self.debug_en, vocal_path = vocal_clone_name)
+            # vocals, sr, ori_len, ori_sr = self.separator.audio_separate(audio_path = audio_name, bgm_path = bgm_name, vocal_path = vocal_ori_name)
+            def on_save_start(vocals, sr, total_frames, ori_sr, *args):
+                english_sentences = self.recognition.recognition(vocals, sr, self.debug_en)
+                total_sentences = self.translation.Subscript_Translation_Srt_Generation(english_sentences, subtitle_name)
+                self.synthesis.synthesize(total_sentences, sr, total_frames, ori_sr, debug_en = self.debug_en, vocal_path = vocal_clone_name)
+            
+            vocals, sr, ori_len, ori_sr, recog_future = self.asyncseparator.audio_separate(
+                audio_path = audio_name, 
+                bgm_path = bgm_name, 
+                on_final_save_callback = on_save_start
+            )
+            if recog_future is not None:
+                recog_future.result()
+            else:
+                english_sentences = self.recognition.recognition(vocals, sr, self.debug_en)
+                total_sentences = self.translation.Subscript_Translation_Srt_Generation(english_sentences, subtitle_name)
+                self.synthesis.synthesize(total_sentences, sr, ori_len, ori_sr, debug_en = self.debug_en, vocal_path = vocal_clone_name)
             job_end = time.time()
             elapse_time = job_end - job_start
 

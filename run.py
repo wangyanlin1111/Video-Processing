@@ -22,7 +22,7 @@ if __name__ == '__main__':
             debug_en = debug_en, 
             sentence_len_in_second = 7, 
             translation_mode = 0, 
-            synthesis_batch_size = 15, 
+            synthesis_batch_size = 20, 
             operation_path = operation_path, 
             h256flag = True, 
             max_cpu_queue_size = 5
