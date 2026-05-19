@@ -22,16 +22,17 @@ if __name__ == '__main__':
             debug_en = debug_en, 
             sentence_len_in_second = 7, 
             translation_mode = 0, 
-            synthesis_batch_size = 20, 
+            synthesis_batch_size = 15, 
             operation_path = operation_path, 
             h256flag = True, 
-            max_cpu_queue_size = 5
+            max_cpu_queue_size = 5,
+            monitor_interval = 2.0
         )
         video_proc.process()
     except Exception as e:
         print(f"Error occurred: {e}")
         traceback.print_exc()
-    os.system("/usr/bin/shutdown")
+    # os.system("/usr/bin/shutdown")
 
 
 

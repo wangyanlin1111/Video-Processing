@@ -62,7 +62,7 @@ class AsyncAudioSeparation:
             free, total = th.cuda.mem_get_info()
             logger.info(f"{YELLOW}Audio Separation: All: {total / 1024 ** 3:.2f} GB, Free: {free / 1024 ** 3:.2f} GB{RESET}")
 
-    def audio_separate(self, audio_path:str = None, bgm_path:str = None, on_final_save_callback = None):
+    def separation(self, audio_path:str = None, bgm_path:str = None, on_final_save_callback = None):
         total_start_time = time.time()
 
         """Acquire audio information"""

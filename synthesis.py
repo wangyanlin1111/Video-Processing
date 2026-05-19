@@ -28,9 +28,12 @@ import math
 import time
 import gc
 import torchaudio
+import queue
+import threading
 
 import numpy as np
 import torch as th
+import soundfile as sf
 import torchaudio.transforms as T
 import pyrubberband as pyrb
 
@@ -179,7 +182,7 @@ class VoiceSynthesis:
             proc_num = end_idx - start_idx
             index_mask = np.arange(start_idx, end_idx)
             texts = [total_sentences[j]["chinese"].strip() for j in index_mask]
-            audios = self.synthesize_batch(texts, speed=1.2)
+            audios = self.synthesize_batch(texts, speed=1.25)
             current_length = np.array([len(audio) for audio in audios])
             target_length = []
             for j in index_mask:
@@ -248,6 +251,123 @@ class VoiceSynthesis:
 
         """Empty Cache"""
         del full_audio, audio
+        gc.collect()
+        if self.DEVICE == "cuda":
+            th.cuda.synchronize()
+            th.cuda.empty_cache()
+            free, _ = th.cuda.mem_get_info()
+            logger.info(f"{YELLOW}After Vocal Synthesis Free: {free / 1024 ** 3:.2f} GB{RESET}")
+        total_end_time = time.time()
+        hours,minutes,seconds,miliseconds = converttime(total_end_time - total_start_time)
+        logger.info(f"{GREEN}Synthesis Time is {hours} hours, {minutes} minutes, {seconds} seconds and {miliseconds} ms{RESET}")
+
+
+    def synthesize_parallel(self, total_sentences, sampling_rate, ori_len, ori_sr, debug_en:bool=False, vocal_path:str=None):
+
+        total_start_time = time.time()
+        prev_end_sample = 0
+        N = len(total_sentences)
+        iteration_num = math.ceil(N / self.BATCHSIZE)
+        if debug_en == True:
+            file = open('regeneration_log.txt', 'w')
+        num_advance = 0
+        advance_flag = 0
+
+        _vocal_path = vocal_path if vocal_path is not None else self.VOCALPATH
+        if os.path.isfile(_vocal_path):
+            os.remove(_vocal_path)
+        total_len = 0
+
+        write_queue = queue.Queue()
+        def writer(sf_file):
+            while True:
+                item = write_queue.get()
+                if item is None:
+                    break
+                sf_file.write(item)
+
+        with sf.SoundFile(_vocal_path, 'w', samplerate=sampling_rate, channels=2) as f:    
+            writer_thread = threading.Thread(target=writer, args=(f,), daemon=True)
+            writer_thread.start()
+            for i in range(iteration_num):
+                audio_segment = th.tensor([], dtype = self.DTYPE, device = self.DEVICE)
+                start_idx = i * self.BATCHSIZE
+                end_idx = min((i + 1)  * self.BATCHSIZE, N)
+                proc_num = end_idx - start_idx
+                index_mask = np.arange(start_idx, end_idx)
+                texts = [total_sentences[j]["chinese"].strip() for j in index_mask]
+
+                """Synthesize audios in batch and calibrate the audio length according to the time difference"""
+                audios = self.synthesize_batch(texts, speed=1.2)
+                current_length = np.array([len(audio) for audio in audios])
+                target_length = []
+                for j in index_mask:
+                    real_duration = total_sentences[j]["end"] - total_sentences[j]["start"]
+                    correction_term = (total_sentences[j+1]["start"] - total_sentences[j]["end"]) * 0.85 if j != (N - 1) else 0
+                    target_length.append(round((real_duration + correction_term) * self.SAMPLERATE))
+                target_length = np.array(target_length)
+                regenerate_flag = current_length > target_length
+                calibration_mask = index_mask[regenerate_flag] - start_idx
+
+                """If the generated audio is longer than the target length, then calibrate the audio by time-stretching and speed up the audio according to the time difference"""
+                if len(calibration_mask) > 0:
+                    for k in calibration_mask:
+                        real_calibration_factor = math.ceil(current_length[k] / target_length[k] * 100) / 100
+                        """If calibration_factor is less than 1.15, then speed up the original synthesised vocal"""
+                        """Else speed up 1.25x and advance the next few sentences 100ms each according to the time difference"""
+                        calibration_factor = min(real_calibration_factor, 1.15)
+                        audio_np = audios[k].squeeze().cpu().to(th.float32).numpy()
+                        stretched_audio_np = pyrb.time_stretch(audio_np, self.SAMPLERATE, rate = calibration_factor)
+                        audios[k] = th.from_numpy(stretched_audio_np).to(self.DEVICE, self.DTYPE)
+                        if (calibration_factor < real_calibration_factor):
+                            difference_samples = len(audios[k]) - target_length[k]
+                            num_advance += int(difference_samples // Advance_SAMPLE)
+                            advance_flag = 1
+                        
+                        if debug_en == True:
+                            content = f"The {k+start_idx}th data, Calibration Factor = {calibration_factor}, Target = {target_length[k]}, Original = {current_length[k]}, Updated = {len(audios[k])}"+"\n"
+                            file.write(content)
+                """Concatenate the audio segment with silence according to the time difference and write the audio segment into local file in each iteration to avoid OOM, which is caused by concatenating all audio segments in memory and writing once in the end"""
+                for j in range(proc_num):
+                    start_sample = round(total_sentences[index_mask[j]]["start"] * self.SAMPLERATE)
+                    silence_samples = max(start_sample - prev_end_sample, 0)
+                    if advance_flag == 1 and silence_samples > Advance_SAMPLE:
+                        silence_samples -= Advance_SAMPLE
+                        num_advance -= 1
+                        advance_flag = 1 if num_advance > 0 else 0
+                    temp_silence = self.generate_silence(silence_samples)
+                    audio_segment = th.concatenate([audio_segment, temp_silence])
+                    del temp_silence  
+                    gc.collect()
+                    audio_segment = th.concatenate([audio_segment, audios[j]])
+                    prev_end_sample += (silence_samples + len(audios[j]))
+                """Resample the audio segment to the target sampling rate if needed and write the audio segment into local file"""
+                if sampling_rate != self.SAMPLERATE:
+                    resampler = self.get_resampler(target_freq = sampling_rate)
+                    audio = resampler(audio_segment.float())
+                else:
+                    audio = audio_segment
+                total_len += len(audio)
+                if audio.dim() == 1:
+                    audio = audio.repeat(2, 1)
+                write_queue.put(audio.cpu().numpy().T)
+                """Empty Cache"""
+                del audios, audio_segment, audio
+                gc.collect()
+                if self.DEVICE == "cuda":
+                    th.cuda.empty_cache()
+            write_queue.put(None)
+            """"After writing all audio segments, if the total length of the audio is shorter than the target length, then pad zeros at the end of the audio"""
+            target_samples = int(round(ori_len * sampling_rate))
+            if int(total_len * ori_sr) < target_samples:
+                numzeros = int(round(target_samples / ori_sr)) - int(total_len)
+                paddimgzeros = np.zeros((numzeros,2), dtype=np.float32)
+                write_queue.put(paddimgzeros)
+            writer_thread.join()
+
+            if debug_en == True:
+                file.close()
+
         gc.collect()
         if self.DEVICE == "cuda":
             th.cuda.synchronize()

@@ -1,3 +1,4 @@
+from importlib.resources import path
 import time
 import gc
 import threading
@@ -31,6 +32,8 @@ from translation import SubscriptTranslation
 from synthesis import VoiceSynthesis
 from merge import compose_video
 from commonfunc import converttime
+from monitor import ResourceMonitor
+from plot_monitor import plot_monitoring
 
 RED = "\033[91m"    
 GREEN = "\033[92m"  
@@ -130,13 +133,15 @@ class VideoProc:
             synthesis_batch_size = 10,      # Batch size of vocal synthesis
             operation_path = './',          # Path of video and audio
             h256flag = True,               # H.265 coding protocl
-            max_cpu_queue_size = 5          # Maximum number of cpu work to be processed
+            max_cpu_queue_size = 5,         # Maximum number of cpu work to be processed
+            monitor_interval = 2.0,         # Resource monitor logging interval in seconds
         ):
 
         self.debug_en = debug_en
         self.operation_path = operation_path
         self.h256flag = h256flag
         self.max_cpu_queue_size = max_cpu_queue_size
+        self.monitor_interval = monitor_interval
 
         # self.separator = AudioSeparation(save_flag = debug_en)
         self.asyncseparator = AsyncAudioSeparation(segment_duration = audio_segment_duration)
@@ -148,7 +153,9 @@ class VideoProc:
     def gpu_workload0(self, idx, video, audio, width, height):
         try:
             job_start = time.time()
-            temp_file_name = self.operation_path + "/temp"
+            file_monitor = None
+            
+            
             """Extract Video and Audio Name"""
             audio_name = os.path.join(self.operation_path, audio)
             video_name = os.path.join(self.operation_path, video)
@@ -159,33 +166,58 @@ class VideoProc:
             name_stem, _ = os.path.splitext(audio)
             clean_stem = name_stem.rstrip()
 
+            """Per-file resource monitor"""
+            monitor_file_name = self.operation_path + "/monitor"
+            if not os.path.exists(monitor_file_name):
+                os.makedirs(monitor_file_name)
+            monitor_log_path = os.path.join(monitor_file_name, f"{clean_stem}.csv")
+            monitor_plot_path = os.path.join(monitor_file_name, f"{clean_stem}.png")
+            file_monitor = ResourceMonitor(
+                interval=self.monitor_interval,
+                log_to_file=monitor_log_path
+            )
+            file_monitor.start()
+
             """Tempfile filename"""
+            temp_file_name = self.operation_path + "/temp"
+            if not os.path.exists(temp_file_name):
+                os.makedirs(temp_file_name)
             bgm_name = os.path.join(temp_file_name, f"{clean_stem}_background.mp3")
             vocal_ori_name = os.path.join(temp_file_name, f"{clean_stem}_vocal_original.mp3")
             vocal_clone_name = os.path.join(temp_file_name, f"{clean_stem}_vocal_clone.mp3")
 
             """Subtitle filename"""
             sub_file_name = self.operation_path + "/sub"
+            if not os.path.exists(sub_file_name):
+                os.makedirs(sub_file_name)
             subtitle_name = os.path.join(sub_file_name, f"{clean_stem}_subscript.srt")
 
             """Start Processing"""
-            # vocals, sr, ori_len, ori_sr = self.separator.audio_separate(audio_path = audio_name, bgm_path = bgm_name, vocal_path = vocal_ori_name)
+            file_monitor.set_workload("separation")
             def on_save_start(vocals, sr, total_frames, ori_sr, *args):
+                file_monitor.set_workload("recognition")
                 english_sentences = self.recognition.recognition(vocals, sr, self.debug_en)
+                file_monitor.set_workload("translation")
                 total_sentences = self.translation.Subscript_Translation_Srt_Generation(english_sentences, subtitle_name)
-                self.synthesis.synthesize(total_sentences, sr, total_frames, ori_sr, debug_en = self.debug_en, vocal_path = vocal_clone_name)
-            
-            vocals, sr, ori_len, ori_sr, recog_future = self.asyncseparator.audio_separate(
+                file_monitor.set_workload("synthesis")
+                self.synthesis.synthesize_parallel(total_sentences, sr, total_frames, ori_sr, debug_en = self.debug_en, vocal_path = vocal_clone_name)
+
+            vocals, sr, ori_len, ori_sr, recog_future = self.asyncseparator.separation(
                 audio_path = audio_name, 
                 bgm_path = bgm_name, 
                 on_final_save_callback = on_save_start
             )
             if recog_future is not None:
+                # file_monitor.set_workload("recognition_translation_synthesis")
                 recog_future.result()
             else:
+                file_monitor.set_workload("recognition")
                 english_sentences = self.recognition.recognition(vocals, sr, self.debug_en)
+                file_monitor.set_workload("translation")
                 total_sentences = self.translation.Subscript_Translation_Srt_Generation(english_sentences, subtitle_name)
-                self.synthesis.synthesize(total_sentences, sr, ori_len, ori_sr, debug_en = self.debug_en, vocal_path = vocal_clone_name)
+                file_monitor.set_workload("synthesis")
+                self.synthesis.synthesize_parallel(total_sentences, sr, ori_len, ori_sr, debug_en = self.debug_en, vocal_path = vocal_clone_name)
+
             job_end = time.time()
             elapse_time = job_end - job_start
 
@@ -203,6 +235,9 @@ class VideoProc:
                 "vocal_original_name":vocal_ori_name,
                 "subtitle_name": subtitle_name,
                 "vocal_clone_name": vocal_clone_name,
+                "file_monitor": file_monitor,
+                "monitor_log_path": monitor_log_path,
+                "monitor_plot_path": monitor_plot_path,
                 "success": True,
                 "elapse_time": elapse_time, 
                 "target_width": width,
@@ -210,6 +245,8 @@ class VideoProc:
             }
         except Exception as e:
             logger.error(f"{RED}Processing {idx}th File Failed: {e}{RESET}")
+            if file_monitor is not None:
+                file_monitor.stop()
             return {"idx": idx, "success": False, "error": str(e)}
         
     def gpu_workload1(self, preprocess_result):
@@ -218,7 +255,10 @@ class VideoProc:
             logger.error(f"{RED}Skip {preprocess_result.get("idx")}th File{RESET}")
             return
         
+        file_monitor = preprocess_result.get("file_monitor")
         try:
+            if file_monitor is not None:
+                file_monitor.set_workload("video_merge")
             logger.info(f"{PUPPLE}Start Video Merging for the {preprocess_result.get("idx")} th File{RESET}")
             flag = compose_video(        
                 video_path=preprocess_result["video_name"],
@@ -229,27 +269,31 @@ class VideoProc:
                 use_h265=self.h256flag
             )
 
-            """If not in debug mode after sucessful merging video files, temp files should be removed"""
-            if flag == 1 and self.debug_en == False:
-                video_name = preprocess_result.get("video_name")
-                audio_name = preprocess_result.get("audio_name")
-                bgm_name = preprocess_result.get("bgm_name")
-                vocal_original_name = preprocess_result.get("vocal_original_name")
-                vocal_clone_name = preprocess_result.get("vocal_clone_name")
-                """If Succeed, delete Redundant Files"""
-                if os.path.isfile(video_name):
-                    os.remove(video_name)
-                if os.path.isfile(audio_name):
-                    os.remove(audio_name)
-                if os.path.isfile(bgm_name):
-                    os.remove(bgm_name)
-                if os.path.isfile(vocal_original_name):
-                    os.remove(vocal_original_name)
-                if os.path.isfile(vocal_clone_name):
-                    os.remove(vocal_clone_name)
+            if flag == 1:
+                plot_monitoring(preprocess_result["monitor_log_path"], save_path=preprocess_result["monitor_plot_path"])
+                """If not in debug mode after sucessful merging video files, temp files should be removed"""
+                if self.debug_en == False:
+                    video_name = preprocess_result.get("video_name")
+                    audio_name = preprocess_result.get("audio_name")
+                    bgm_name = preprocess_result.get("bgm_name")
+                    vocal_original_name = preprocess_result.get("vocal_original_name")
+                    vocal_clone_name = preprocess_result.get("vocal_clone_name")
+                    """If Succeed, delete Redundant Files"""
+                    if os.path.isfile(video_name):
+                        os.remove(video_name)
+                    if os.path.isfile(audio_name):
+                        os.remove(audio_name)
+                    if os.path.isfile(bgm_name):
+                        os.remove(bgm_name)
+                    if os.path.isfile(vocal_original_name):
+                        os.remove(vocal_original_name)
+                    if os.path.isfile(vocal_clone_name):
+                        os.remove(vocal_clone_name)
         except Exception as e:
             logger.error(f"{RED}Merge {preprocess_result['idx']}th File Failed: {e}{RESET}")
         finally:
+            if file_monitor is not None:
+                file_monitor.stop()
             free, total = th.cuda.mem_get_info()
             logger.info(f"{YELLOW}After Video Processing All: {total / 1024 ** 3:.2f} GB, Free: {free / 1024 ** 3:.2f} GB{RESET}")
 
@@ -272,33 +316,37 @@ class VideoProc:
 
     def process(self):
         start_time = time.time()
-        if not self.matched:
-            logger.info(f"{PUPPLE}Files not found, Exit{RESET}")
-            return
-        """Make dir"""
-        temp_file_name = os.path.join(self.operation_path, "temp")
-        tempfolder = Path(temp_file_name) 
-        tempfolder.mkdir(parents=True, exist_ok=True)
 
-        subtitle_name = os.path.join(self.operation_path, "sub")
-        subfolder = Path(subtitle_name)  
-        subfolder.mkdir(parents=True, exist_ok=True)
-   
-        logger.info(f"{PUPPLE}Detect {len(self.matched)} files{RESET}")
-
-        gpu0_sem = threading.Semaphore(1)   
-        gpu1_sem = threading.Semaphore(self.max_cpu_queue_size)
-
-        def task_pipeline(idx, video, audio, width, height):
-            with gpu0_sem:
-                result = self.gpu_workload0(idx, video, audio, width, height)
-            if not result["success"]:
-                logger.error(f"Skip {idx} due to workload0 failure")
+        try:
+            if not self.matched:
+                logger.info(f"{PUPPLE}Files not found, Exit{RESET}")
                 return
-            self._gpu_task_wrapper(result, gpu1_sem)
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            for idx, (video, audio, w, h) in enumerate(self.matched, 1):
-                executor.submit(task_pipeline, idx, video, audio, w, h)
+            """Make dir"""
+            temp_file_name = os.path.join(self.operation_path, "temp")
+            tempfolder = Path(temp_file_name) 
+            tempfolder.mkdir(parents=True, exist_ok=True)
+
+            subtitle_name = os.path.join(self.operation_path, "sub")
+            subfolder = Path(subtitle_name)  
+            subfolder.mkdir(parents=True, exist_ok=True)
+    
+            logger.info(f"{PUPPLE}Detect {len(self.matched)} files{RESET}")
+
+            gpu0_sem = threading.Semaphore(1)   
+            gpu1_sem = threading.Semaphore(self.max_cpu_queue_size)
+
+            def task_pipeline(idx, video, audio, width, height):
+                with gpu0_sem:
+                    result = self.gpu_workload0(idx, video, audio, width, height)
+                if not result["success"]:
+                    logger.error(f"Skip {idx} due to workload0 failure")
+                    return
+                self._gpu_task_wrapper(result, gpu1_sem)
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                for idx, (video, audio, w, h) in enumerate(self.matched, 1):
+                    executor.submit(task_pipeline, idx, video, audio, w, h)
+        finally:
+            pass
 
         end_time = time.time()
         hours,minutes,seconds,miliseconds = converttime(end_time - start_time)
