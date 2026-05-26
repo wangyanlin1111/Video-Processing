@@ -6,7 +6,7 @@ import logging
 import time
 import re
 import gc
-import math
+import soundfile as sf
 import numpy as np
 import torch as th
 import torchaudio.transforms as T
@@ -160,7 +160,9 @@ class Recognition:
                 
         final_subtitles = []
         durations = []
-        for sentence in sentences:
+        prevgaps = []
+        aftergaps = []
+        for i, sentence in enumerate(sentences):
             start = sentence["start"]
             end = sentence["end"]
             text = sentence["text"]
@@ -172,13 +174,16 @@ class Recognition:
                     "start": start,
                     "end": end
                 })
+                prev_gap = 1.0 if i == 0 else (sentences[i]["start"] - sentences[i-1]["end"])
+                after_gap = 1.0 if i == len(sentences) - 1 else (sentences[i+1]["start"] - sentences[i]["end"])
+                prevgaps.append(prev_gap)
+                aftergaps.append(after_gap)
                 durations.append(duration)
                 continue
 
             parts = re.split(SPLIT_PATTERN, text)
-            # parts = [p.strip() for p in parts if p.strip()]
             parts = [p.strip() for p in parts if p is not None and p.strip()]
-            
+
             chunks = []
             temp = ""
             for part in parts:
@@ -205,7 +210,7 @@ class Recognition:
             time_per_chunk = duration / chunk_count
 
             current_start = start
-            for chunk in chunks:
+            for chunk_idx, chunk in enumerate(chunks):
                 current_end = current_start + time_per_chunk
                 if chunk.strip():
                     final_subtitles.append({
@@ -213,21 +218,43 @@ class Recognition:
                         "start": current_start,
                         "end": current_end
                     })
+                    # Gaps for split chunks: only sentence boundaries have real gaps
+                    if chunk_idx == 0:
+                        prev_gap = 1.0 if i == 0 else (sentences[i]["start"] - sentences[i-1]["end"])
+                    else:
+                        prev_gap = 0.0
+                    if chunk_idx == chunk_count - 1:
+                        after_gap = 1.0 if i == len(sentences) - 1 else (sentences[i+1]["start"] - sentences[i]["end"])
+                    else:
+                        after_gap = 0.0
+                    prevgaps.append(prev_gap)
+                    aftergaps.append(after_gap)
                     durations.append(current_end - current_start)
                 current_start = current_end
 
-        if durations[0] > 3:
-            idx = 0
+        # Prefer segments with duration 5~10s and gaps > 0.5s on both sides
+        idx = None
+        candidate_idx = []
+        for idx_candidate, (dur, prev_g, after_g) in enumerate(zip(durations, prevgaps, aftergaps)):
+            if 5.0 <= dur <= 10.0 and prev_g >= 0.5 and after_g >= 0.5:
+                candidate_idx.append((idx_candidate, dur))
+        if candidate_idx is not None and len(candidate_idx) > 0:        
+            candidate_idx.sort(key=lambda x: x[1], reverse=True)
+            idx = candidate_idx[0][0]
         else:
-            if durations:
-                durations_tensor = th.tensor(durations)
-                idx = th.argmin(th.abs(durations_tensor - REF_DURATION)).item()
-            else:
+            # Fallback to original logic
+            if durations[0] > 3:
                 idx = 0
+            else:
+                if durations:
+                    durations_tensor = th.tensor(durations)
+                    idx = th.argmin(th.abs(durations_tensor - REF_DURATION)).item()
+                else:
+                    idx = 0
 
         return final_subtitles, idx
 
-    def recognition(self, audio, sr, debug_en):
+    def recognition(self, audio, sr, debug_en, ref_audio_path = None):
         total_start_time = time.time()
         try:
             """Resample to 16KHz and for faster_whisper the input must be numpy on cpu"""
@@ -243,9 +270,20 @@ class Recognition:
             segments_list = list(segments_generator)
              
             """Generate sentences from split segments"""
-            english_sentences, _ = self.process_segments_to_final_subtitles(segments_list)
+            english_sentences, idx = self.process_segments_to_final_subtitles(segments_list)
 
-            """Save debug info"""
+            """Save reference audio if ref_audio_path is provided"""
+            if ref_audio_path is not None:
+                if os.path.isfile(ref_audio_path):
+                    os.remove(ref_audio_path)
+                ref_audio = audio[:, int((english_sentences[idx]["start"] - 0.25) * sr): int((english_sentences[idx]["end"] + 0.25) * sr)]
+                if ref_audio.ndim > 1 and ref_audio.shape[0] > 1:
+                    mono_audio = th.mean(ref_audio, dim=0)  
+                else:
+                    mono_audio = ref_audio.squeeze(0)
+                sf.write(ref_audio_path, mono_audio.cpu().float().numpy(), sr)
+            ref_text = english_sentences[idx]["text"]
+            """Save debug info"""   
             if debug_en == True:
                 with open(r"EnglishContent_origin.txt", "w", encoding="utf-8") as f0:
                     for i, segment in enumerate(segments_list):
@@ -269,7 +307,7 @@ class Recognition:
             total_end_time = time.time()
             hours,minutes,seconds,miliseconds = converttime(total_end_time - total_start_time)
             logger.info(f"{GREEN}Transcript Time is {hours} hours, {minutes} minutes, {seconds} seconds and {miliseconds} ms{RESET}")
-            return english_sentences
+            return english_sentences, ref_text
         except Exception as e:
             """Throw Exception"""
             error_detail = get_error_detail(e)

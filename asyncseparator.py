@@ -1,6 +1,10 @@
+
 import concurrent
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+conda_lib = os.path.join(os.environ['CONDA_PREFIX'], 'lib')
+os.environ['LD_LIBRARY_PATH'] = f"{conda_lib}:{os.environ.get('LD_LIBRARY_PATH', '')}"
 
 import logging
 logging.basicConfig(
@@ -14,7 +18,6 @@ import gc
 import threading
 import queue
 import torchaudio
-
 
 import numpy as np
 import torch as th

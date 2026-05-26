@@ -55,7 +55,7 @@ default_language = "Chinese"
 
 class VoiceSynthesis:
     def __init__(self, batchsize: int = None, gen_model_path: str = None, syn_model_path: str = None, instruction: str = None):
-        default_instruction = instruction if instruction is not None else "45岁男性, 低沉而有磁性, 颗粒感强, 语速非常快，句子间间隔短"
+        default_instruction = instruction if instruction is not None else "45岁男性, 低沉有磁性, 颗粒感强, 语速非常快, 句子间间隔短"
         init_start_time = time.time()
         self.VOCALPATH = "vocal_clone.mp3"
         self.BATCHSIZE = batchsize if batchsize is not None else 10
@@ -71,6 +71,8 @@ class VoiceSynthesis:
         self.SAMPLERATE = Qwen3TTSModel_SAMPLE_RATE
         self.calibrationsampler = T.Resample(orig_freq=self.SAMPLERATE, new_freq=self.SAMPLERATE).to(self.DEVICE)
         """First Design the reference audio for voice clone"""
+        self.SYNTHESISMODEL = None
+        self.VOICECLONEPROMPT = None
         design_model = Qwen3TTSModel.from_pretrained(
             _gen_model_name_path,
             device_map = self.DEVICE,
@@ -82,6 +84,7 @@ class VoiceSynthesis:
             language = default_language,
             instruct = default_instruction
         )
+        ref_audio_withzeros = np.concatenate([np.zeros(int(0.5 * sr)), ref_wavs[0], np.zeros(int(0.5 * sr))])
         """Empty Cache"""
         del design_model
         gc.collect()
@@ -94,16 +97,17 @@ class VoiceSynthesis:
             attn_implementation= self.ATTENTION
         )
         self.VOICECLONEPROMPT = self.SYNTHESISMODEL.create_voice_clone_prompt(
-            ref_audio=(ref_wavs[0], sr),   
+            ref_audio=(ref_audio_withzeros, sr),   
             ref_text=default_text,
         )
         init_end_time = time.time()
         logger.info(f"{GREEN}Voice Synthesis Init Time: {init_end_time - init_start_time:.4f}s{RESET}")
         self._resampler_cache = {}
+        self._silence_cache = {}
         if self.DEVICE == "cuda":
             free, total = th.cuda.mem_get_info()
             logger.info(f"{YELLOW}Voice Synthesis Allocated: All: {total / 1024 ** 3:.2f} GB, Free: {free / 1024 ** 3:.2f} GB{RESET}")
-        self.occupied_mem =  (total - free) / 1024 ** 3 
+        
 
     def get_resampler(self, target_freq: int) -> T.Resample:
         """Acquire Resampler on self.DEVICE"""
@@ -122,7 +126,10 @@ class VoiceSynthesis:
 
     def generate_silence(self, duration_insamples):
         """Generate silence from duration(duration in seconds)"""
-        return th.zeros(int(duration_insamples), dtype = self.DTYPE, device=self.DEVICE)
+        key = int(duration_insamples)
+        if key not in self._silence_cache:
+            self._silence_cache[key] = th.zeros(key, dtype=self.DTYPE, device=self.DEVICE)
+        return self._silence_cache[key].clone()
 
     @th.no_grad()
     def synthesize_single(self, text, speed=1.0):
@@ -200,7 +207,8 @@ class VoiceSynthesis:
                     calibration_factor = min(real_calibration_factor, 1.15)
                     audio_np = audios[k].squeeze().cpu().to(th.float32).numpy()
                     stretched_audio_np = pyrb.time_stretch(audio_np, self.SAMPLERATE, rate = calibration_factor)
-                    audios[k] = th.from_numpy(stretched_audio_np).to(self.DEVICE, self.DTYPE)
+                    # audios[k] = th.from_numpy(stretched_audio_np).to(self.DEVICE, self.DTYPE)
+                    audios[k] = th.as_tensor(stretched_audio_np, device=self.DEVICE, dtype=self.DTYPE)
                     if (calibration_factor < real_calibration_factor):
                         difference_samples = len(audios[k]) - target_length[k]
                         num_advance += int(difference_samples // Advance_SAMPLE)
@@ -227,8 +235,8 @@ class VoiceSynthesis:
             del audios
             gc.collect()
             if self.DEVICE == "cuda":
+                th.cuda.synchronize()
                 th.cuda.empty_cache()
-                # th.cuda.synchronize()
         if debug_en == True:
             file.close()
         if sampling_rate != self.SAMPLERATE:
@@ -241,13 +249,14 @@ class VoiceSynthesis:
             missingzeros = int(round(sampling_rate * ori_len / ori_sr)) - len(audio)
             audio = th.nn.functional.pad(audio, (0, missingzeros))
 
+        audio = audio.to('cpu').float() 
         if audio.dim() == 1:
             audio = audio.repeat(2, 1)
 
         _vocal_path = vocal_path if vocal_path is not None else self.VOCALPATH
         if os.path.isfile(_vocal_path):
             os.remove(_vocal_path)
-        torchaudio.save(_vocal_path, audio.cpu(), sampling_rate)
+        torchaudio.save(_vocal_path, audio, sampling_rate)
 
         """Empty Cache"""
         del full_audio, audio
@@ -262,9 +271,28 @@ class VoiceSynthesis:
         logger.info(f"{GREEN}Synthesis Time is {hours} hours, {minutes} minutes, {seconds} seconds and {miliseconds} ms{RESET}")
 
 
-    def synthesize_parallel(self, total_sentences, sampling_rate, ori_len, ori_sr, debug_en:bool=False, vocal_path:str=None):
+    def synthesize_parallel(
+            self, 
+            total_sentences, 
+            sampling_rate, 
+            ori_len, 
+            ori_sr, 
+            debug_en : bool=False, 
+            vocal_path : str=None
+        ):
 
         total_start_time = time.time()
+        if self.SYNTHESISMODEL is None:
+            self.SYNTHESISMODEL = Qwen3TTSModel.from_pretrained(
+                self.MODELNAME,
+                device_map = self.DEVICE,
+                dtype = self.DTYPE,
+                attn_implementation= self.ATTENTION
+            )
+            self.VOICECLONEPROMPT = self.SYNTHESISMODEL.create_voice_clone_prompt(
+                ref_audio=ref_audio_path,   
+                ref_text=ref_text,
+            )
         prev_end_sample = 0
         N = len(total_sentences)
         iteration_num = math.ceil(N / self.BATCHSIZE)
@@ -289,6 +317,7 @@ class VoiceSynthesis:
         with sf.SoundFile(_vocal_path, 'w', samplerate=sampling_rate, channels=2) as f:    
             writer_thread = threading.Thread(target=writer, args=(f,), daemon=True)
             writer_thread.start()
+            reset_time = 0
             for i in range(iteration_num):
                 audio_segment = th.tensor([], dtype = self.DTYPE, device = self.DEVICE)
                 start_idx = i * self.BATCHSIZE
@@ -296,7 +325,17 @@ class VoiceSynthesis:
                 proc_num = end_idx - start_idx
                 index_mask = np.arange(start_idx, end_idx)
                 texts = [total_sentences[j]["chinese"].strip() for j in index_mask]
-
+                starts = [total_sentences[j]["start"] for j in index_mask]
+                if starts[0] - reset_time > 7200:
+                    """If the start time of the current batch is more than 2 hour away from the reset_time, then reset the synthesis model to avoid potential memory leak issue in long video synthesis"""
+                    del self.SYNTHESISMODEL
+                    self.SYNTHESISMODEL = Qwen3TTSModel.from_pretrained(
+                        self.MODELNAME,
+                        device_map = self.DEVICE,
+                        dtype = self.DTYPE,
+                        attn_implementation= self.ATTENTION
+                    )
+                    reset_time = starts[0]
                 """Synthesize audios in batch and calibrate the audio length according to the time difference"""
                 audios = self.synthesize_batch(texts, speed=1.2)
                 current_length = np.array([len(audio) for audio in audios])
@@ -348,6 +387,7 @@ class VoiceSynthesis:
                 else:
                     audio = audio_segment
                 total_len += len(audio)
+
                 if audio.dim() == 1:
                     audio = audio.repeat(2, 1)
                 write_queue.put(audio.cpu().numpy().T)

@@ -6,6 +6,7 @@ import re
 
 import multiprocessing
 import os
+
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 os.environ["OMP_NUM_THREADS"] = str(multiprocessing.cpu_count())
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -29,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from asyncseparator import AsyncAudioSeparation
 from recognition import Recognition
 from translation import SubscriptTranslation
-from synthesis import VoiceSynthesis
+from synthesis_vllm import VoiceSynthesisIndexTTS2
 from merge import compose_video
 from commonfunc import converttime
 from monitor import ResourceMonitor
@@ -143,11 +144,10 @@ class VideoProc:
         self.max_cpu_queue_size = max_cpu_queue_size
         self.monitor_interval = monitor_interval
 
-        # self.separator = AudioSeparation(save_flag = debug_en)
         self.asyncseparator = AsyncAudioSeparation(segment_duration = audio_segment_duration)
         self.recognition = Recognition(max_duration = sentence_len_in_second)
         self.translation = SubscriptTranslation(option = translation_mode)
-        self.synthesis = VoiceSynthesis(batchsize = synthesis_batch_size)
+        self.synthesis = VoiceSynthesisIndexTTS2()
         self.matched = classify_video_audio_and_matched_pairs(operation_path)
 
     def gpu_workload0(self, idx, video, audio, width, height):
@@ -185,7 +185,7 @@ class VideoProc:
             bgm_name = os.path.join(temp_file_name, f"{clean_stem}_background.mp3")
             vocal_ori_name = os.path.join(temp_file_name, f"{clean_stem}_vocal_original.mp3")
             vocal_clone_name = os.path.join(temp_file_name, f"{clean_stem}_vocal_clone.mp3")
-
+            ref_audio_name = os.path.join(temp_file_name, f"{clean_stem}_ref.mp3")
             """Subtitle filename"""
             sub_file_name = self.operation_path + "/sub"
             if not os.path.exists(sub_file_name):
@@ -196,13 +196,21 @@ class VideoProc:
             file_monitor.set_workload("separation")
             def on_save_start(vocals, sr, total_frames, ori_sr, *args):
                 file_monitor.set_workload("recognition")
-                english_sentences = self.recognition.recognition(vocals, sr, self.debug_en)
+                english_sentences, _ = self.recognition.recognition(vocals, sr, self.debug_en, ref_audio_name)
                 file_monitor.set_workload("translation")
                 total_sentences = self.translation.Subscript_Translation_Srt_Generation(english_sentences, subtitle_name)
                 file_monitor.set_workload("synthesis")
-                self.synthesis.synthesize_parallel(total_sentences, sr, total_frames, ori_sr, debug_en = self.debug_en, vocal_path = vocal_clone_name)
+                self.synthesis.synthesize_parallel(
+                    total_sentences, 
+                    sr, 
+                    total_frames,
+                    ori_sr, 
+                    debug_en = self.debug_en,
+                    vocal_path = vocal_clone_name,
+                    ref_audio_path = ref_audio_name
+                )
 
-            vocals, sr, ori_len, ori_sr, recog_future = self.asyncseparator.separation(
+            vocals, sr, total_frames, ori_sr, recog_future = self.asyncseparator.separation(
                 audio_path = audio_name, 
                 bgm_path = bgm_name, 
                 on_final_save_callback = on_save_start
@@ -212,11 +220,19 @@ class VideoProc:
                 recog_future.result()
             else:
                 file_monitor.set_workload("recognition")
-                english_sentences = self.recognition.recognition(vocals, sr, self.debug_en)
+                english_sentences, _ = self.recognition.recognition(vocals, sr, 0, ref_audio_name)
                 file_monitor.set_workload("translation")
                 total_sentences = self.translation.Subscript_Translation_Srt_Generation(english_sentences, subtitle_name)
                 file_monitor.set_workload("synthesis")
-                self.synthesis.synthesize_parallel(total_sentences, sr, ori_len, ori_sr, debug_en = self.debug_en, vocal_path = vocal_clone_name)
+                self.synthesis.synthesize_parallel(
+                    total_sentences, 
+                    sr, 
+                    total_frames,
+                    ori_sr, 
+                    debug_en = self.debug_en,
+                    vocal_path = vocal_clone_name,
+                    ref_audio_path = ref_audio_name
+                )
 
             job_end = time.time()
             elapse_time = job_end - job_start
@@ -235,6 +251,7 @@ class VideoProc:
                 "vocal_original_name":vocal_ori_name,
                 "subtitle_name": subtitle_name,
                 "vocal_clone_name": vocal_clone_name,
+                "ref_audio_name": ref_audio_name,
                 "file_monitor": file_monitor,
                 "monitor_log_path": monitor_log_path,
                 "monitor_plot_path": monitor_plot_path,
@@ -278,6 +295,7 @@ class VideoProc:
                     bgm_name = preprocess_result.get("bgm_name")
                     vocal_original_name = preprocess_result.get("vocal_original_name")
                     vocal_clone_name = preprocess_result.get("vocal_clone_name")
+                    re_audio_name = preprocess_result.get("ref_audio_name")
                     """If Succeed, delete Redundant Files"""
                     if os.path.isfile(video_name):
                         os.remove(video_name)
@@ -289,6 +307,8 @@ class VideoProc:
                         os.remove(vocal_original_name)
                     if os.path.isfile(vocal_clone_name):
                         os.remove(vocal_clone_name)
+                    if os.path.isfile(re_audio_name):
+                        os.remove(re_audio_name) 
         except Exception as e:
             logger.error(f"{RED}Merge {preprocess_result['idx']}th File Failed: {e}{RESET}")
         finally:

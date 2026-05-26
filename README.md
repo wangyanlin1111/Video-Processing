@@ -44,9 +44,8 @@
 
 ### 安装依赖库
 `pip install torch==2.10.0 torchaudio==2.10.0 torchcodec==0.10.0 torchvision==0.25.0 transformers`
-`pip qwen_tts demucs faster_whisper pyrubberband huggingface_hub pymediainfo pydub`
+`pip install qwen_tts demucs faster_whisper pyrubberband huggingface_hub pymediainfo pydub`
 `conda install -c conda-forge ffmpeg mkl=2021.4.0 libstdcxx-ng -y`
-`conda install numpy tqdm -y`
 如果运行代码报bug'ImportError: /usr/lib/x86_64-linux-gnu/libstdc++.so.6: version `CXXABI_1.3.15' not found',则分别运行：
 `echo 'export LD_LIBRARY_PATH=/root/miniconda3/envs/video_proc/lib:$LD_LIBRARY_PATH' >> ~/.bashrc`
 `source ~/.bashrc`

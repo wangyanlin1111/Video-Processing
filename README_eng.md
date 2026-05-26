@@ -44,9 +44,8 @@ It is recommended to use Conda to create an independent runtime environment for 
 
 ### Install Dependencies
 `pip install torch==2.10.0 torchaudio==2.10.0 torchcodec==0.10.0 torchvision==0.25.0 transformers`
-`pip qwen_tts demucs faster_whisper pyrubberband huggingface_hub pymediainfo pydub`
+`pip install qwen_tts demucs faster_whisper pyrubberband huggingface_hub pymediainfo pydub`
 `conda install -c conda-forge ffmpeg mkl=2021.4.0 libstdcxx-ng -y`
-`conda install numpy tqdm -y`
 Execuate the following two lines if you encounter issues like 'ImportError: /usr/lib/x86_64-linux-gnu/libstdc++.so.6: version `CXXABI_1.3.15' not found':
 `echo 'export LD_LIBRARY_PATH=/root/miniconda3/envs/video_proc/lib:$LD_LIBRARY_PATH' >> ~/.bashrc`
 `source ~/.bashrc`
