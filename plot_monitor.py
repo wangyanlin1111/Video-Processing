@@ -1,6 +1,14 @@
+import os
+import matplotlib
+
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
 import numpy as np
+
+_CJK_FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+_CJK_FONT = fm.FontProperties(fname=_CJK_FONT_PATH)
+matplotlib.rcParams['axes.unicode_minus'] = False  
 
 
 def plot_monitoring(csv_path, save_path=None):
@@ -69,7 +77,8 @@ def plot_monitoring(csv_path, save_path=None):
             mid = start + (end - start) / 2
             ylim = ax.get_ylim()
             ax.text(mid, ylim[1] * 0.92, func, ha='center', va='top',
-                    fontsize=8, bbox=dict(boxstyle='round,pad=0.2',
+                    fontsize=8, fontproperties=_CJK_FONT,
+                    bbox=dict(boxstyle='round,pad=0.2',
                     facecolor=colors[i], alpha=0.5))
 
     axes[-1].set_xlabel('Elapsed Time (seconds)')
@@ -79,9 +88,12 @@ def plot_monitoring(csv_path, save_path=None):
         legend_handles = [plt.Rectangle((0, 0), 1, 1, facecolor=colors[i], alpha=0.15)
                           for i in range(len(blocks))]
         axes[0].legend(legend_handles, blocks['Function'].tolist(),
-                       loc='upper right', fontsize=7, ncol=2)
+                       loc='upper right', fontsize=7, ncol=2,
+                       prop=_CJK_FONT)
 
     plt.tight_layout()
     if save_path:
+        if os.path.isfile(save_path):
+            os.remove(save_path)
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close() 

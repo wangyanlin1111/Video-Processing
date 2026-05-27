@@ -97,6 +97,8 @@ class TTSRequest:
     max_text_tokens_per_sentence: int = 120
     speed: float = 1.0
     max_mel_tokens: Optional[int] = None
+    ref_reset: int = 1
+    emo_reset: int = 1
 
     def __post_init__(self):
         if self.emo_vec is None:
@@ -241,18 +243,20 @@ class VoiceSynthesisIndexTTS2:
                             content={"status": "error", "error": "情感向量之和不能超过1.5"})
 
                 sr, wav = await tts.infer(
-                    spk_audio_prompt=data["spk_audio_path"],
-                    text=data["text"],
-                    output_path=None,
-                    emo_audio_prompt=emo_ref_path,
-                    emo_alpha=emo_weight,
-                    emo_vector=vec,
-                    use_emo_text=(emo_control_method == 3),
-                    emo_text=data.get("emo_text", None),
-                    use_random=data.get("emo_random", False),
-                    max_text_tokens_per_sentence=int(data.get("max_text_tokens_per_sentence", 120)),
-                    speed=data.get("speed", 1.0),
-                    max_mel_tokens=data.get("max_mel_tokens", None),
+                    spk_audio_prompt = data["spk_audio_path"],
+                    text = data["text"],
+                    output_path = None,
+                    emo_audio_prompt = emo_ref_path,
+                    emo_alpha = emo_weight,
+                    emo_vector = vec,
+                    use_emo_text = (emo_control_method == 3),
+                    emo_text = data.get("emo_text", None),
+                    use_random = data.get("emo_random", False),
+                    max_text_tokens_per_sentence = int(data.get("max_text_tokens_per_sentence", 120)),
+                    speed = data.get("speed", 1.0),
+                    max_mel_tokens = data.get("max_mel_tokens", None),
+                    ref_reset = data.get("ref_reset", True),
+                    emo_reset = data.get("emo_reset", True),
                 )
                 with io.BytesIO() as buf:
                     sf.write(buf, wav, sr, format='WAV')
@@ -270,10 +274,20 @@ class VoiceSynthesisIndexTTS2:
     def start(self) -> None:
         if self._server_process is not None:
             return
+        # Clear CUDA-tensor caches to avoid pickling errors when spawning subprocess
+        self._resampler_cache.clear()
+        self._silence_cache.clear()
+        gc.collect()
+        if th.cuda.is_available():
+            th.cuda.empty_cache()
         _loguru_logger.info("Starting TTS server subprocess...")
         t0 = time.time()
         self._server_process = multiprocessing.Process(
-            target=self._run_server, name="tts_server",
+            target=VoiceSynthesisIndexTTS2._run_server,
+            args=(self.model_dir, self.is_fp16, self.gpu_memory_utilization,
+                  self.qwenemo_gpu_memory_utilization, self.load_qwen_emo,
+                  self.enable_sleep_mode, self.host, self.port),
+            name="tts_server",
         )
         self._server_process.start()
         logger.info(f"{GREEN}Vocal Synthesis via vLLM Init Time: {time.time() - t0:.4f}s{RESET}")
@@ -282,21 +296,31 @@ class VoiceSynthesisIndexTTS2:
             logger.info(f"{YELLOW}Vocal Synthesis via vLLM: All: {total / 1024 ** 3:.2f} GB, Free: {free / 1024 ** 3:.2f} GB{RESET}")
         self._wait_ready()
 
-    def _run_server(self) -> None:
+    @staticmethod
+    def _run_server(model_dir, is_fp16, gpu_memory_utilization,
+                    qwenemo_gpu_memory_utilization, load_qwen_emo,
+                    enable_sleep_mode, host, port) -> None:
         # expandable_segments 与 vLLM 内存池不兼容，子进程中必须清除
         os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
-        app = self._create_app(
-            model_dir=self.model_dir, is_fp16=self.is_fp16,
-            gpu_memory_utilization=self.gpu_memory_utilization,
-            qwenemo_gpu_memory_utilization=self.qwenemo_gpu_memory_utilization,
-            load_qwen_emo=self.load_qwen_emo,
-            enable_sleep_mode=self.enable_sleep_mode,
+        app = VoiceSynthesisIndexTTS2._create_app(
+            model_dir=model_dir, is_fp16=is_fp16,
+            gpu_memory_utilization=gpu_memory_utilization,
+            qwenemo_gpu_memory_utilization=qwenemo_gpu_memory_utilization,
+            load_qwen_emo=load_qwen_emo,
+            enable_sleep_mode=enable_sleep_mode,
         )
-        uvicorn.run(app, host=self.host, port=self.port, log_level="warning")
+        uvicorn.run(app, host=host, port=port, log_level="warning")
 
     def _wait_ready(self, timeout: float = 300.0, interval: float = 2.0) -> None:
         start = time.time()
         while time.time() - start < timeout:
+            # Early exit: subprocess crashed
+            if self._server_process is not None and not self._server_process.is_alive():
+                exitcode = self._server_process.exitcode
+                raise RuntimeError(
+                    f"TTS server process exited prematurely with code {exitcode}. "
+                    f"Check logs/vllm_startup.log for details."
+                )
             try:
                 if requests.get(self._health_url, timeout=5).status_code == 200:
                     _loguru_logger.info("Server is healthy and ready.")
@@ -320,6 +344,7 @@ class VoiceSynthesisIndexTTS2:
         self._server_process = None
         gc.collect()
         if th.cuda.is_available():
+            th.cuda.synchronize()
             th.cuda.empty_cache()
             free, total = th.cuda.mem_get_info()
             _loguru_logger.info(f"GPU: {total / 1024**3:.2f} GB total, {free / 1024**3:.2f} GB free")
@@ -448,7 +473,7 @@ class VoiceSynthesisIndexTTS2:
                 resetflag = 1 if i == 0 else 0 
                 audio_segment = th.tensor([], dtype = self.dtype, device = self.device)
                 texts = total_sentences[i]["chinese"].strip()
-                max_mel_tokens = math.ceil((total_sentences[i]["end"]- total_sentences[i]["start"] + 0.25) * INDEXTTS_SAMPLE_RATE / 256)
+                max_mel_tokens = math.ceil((total_sentences[i]["end"]- total_sentences[i]["start"] + 1) * INDEXTTS_SAMPLE_RATE / 256)
                 audio = self.synthesize_single(
                     text = texts, 
                     spk_audio_path = ref_audio_path, 
@@ -504,6 +529,7 @@ class VoiceSynthesisIndexTTS2:
                 del audio_to_save, audio_segment, audio
                 gc.collect()
                 if self.device == "cuda":
+                    th.cuda.synchronize()
                     th.cuda.empty_cache()
 
             # Pad to original video length
@@ -530,6 +556,9 @@ class VoiceSynthesisIndexTTS2:
             th.cuda.empty_cache()
             free, _ = th.cuda.mem_get_info()
             logger.info(f"{YELLOW}After vllm shut down Free: {free / 1024 ** 3:.2f} GB{RESET}")
+            mem_ava_gb =  free / (1024 ** 3) - 1.0
         total_end_time = time.time()
         hours, minutes, seconds, ms = converttime(total_end_time - total_start_time)
         logger.info(f"{GREEN}Synthesis Time is {hours}h {minutes}m {seconds}s {ms}ms{RESET}")
+        return mem_ava_gb
+

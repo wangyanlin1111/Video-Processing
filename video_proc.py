@@ -26,6 +26,12 @@ from pymediainfo import MediaInfo
 from pydub.utils import mediainfo
 from concurrent.futures import ThreadPoolExecutor, Future
 
+try:
+    import pynvml
+    _HAS_PYNVML = True
+except ImportError:
+    _HAS_PYNVML = False
+
 # from separation import AudioSeparation
 from asyncseparator import AsyncAudioSeparation
 from recognition import Recognition
@@ -136,6 +142,11 @@ class VideoProc:
             h256flag = True,               # H.265 coding protocl
             max_cpu_queue_size = 5,         # Maximum number of cpu work to be processed
             monitor_interval = 2.0,         # Resource monitor logging interval in seconds
+            merge_gpu_util_threshold = 15,  # GPU util % below which merge is considered idle
+            merge_gpu_mem_threshold_gb = 4, # GPU available memory (GB) above which merge is considered idle
+            merge_idle_window_seconds = 30, # Seconds for sliding window average
+            merge_idle_sample_interval = 0.5, # Granularity within the window
+            merge_idle_timeout = 1800,      # Interval (s) between "still waiting" warnings
         ):
 
         self.debug_en = debug_en
@@ -143,6 +154,21 @@ class VideoProc:
         self.h256flag = h256flag
         self.max_cpu_queue_size = max_cpu_queue_size
         self.monitor_interval = monitor_interval
+        self.merge_gpu_util_threshold = merge_gpu_util_threshold
+        self.merge_gpu_mem_threshold_gb = merge_gpu_mem_threshold_gb
+        self.merge_idle_window_seconds = merge_idle_window_seconds
+        self.merge_idle_sample_interval = merge_idle_sample_interval
+        self.merge_idle_timeout = merge_idle_timeout
+
+        if _HAS_PYNVML:
+            try:
+                pynvml.nvmlInit()
+            except pynvml.NVMLError:
+                pass
+
+        # Tracks merges that are pending or in-flight (set BEFORE gpu0_sem release)
+        self._merge_count = 0
+        self._merge_count_lock = threading.Lock()
 
         self.asyncseparator = AsyncAudioSeparation(segment_duration = audio_segment_duration)
         self.recognition = Recognition(max_duration = sentence_len_in_second)
@@ -150,11 +176,102 @@ class VideoProc:
         self.synthesis = VoiceSynthesisIndexTTS2()
         self.matched = classify_video_audio_and_matched_pairs(operation_path)
 
+    @staticmethod
+    def _get_gpu_stats():
+        """Return (gpu_util_pct: float, gpu_mem_used_gb: float), or (None, None) on failure."""
+        util_pct = None
+        mem_ava_gb = None
+
+        # --- GPU utilization via pynvml ---
+        if _HAS_PYNVML:
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                util_pct = float(util.gpu)
+            except pynvml.NVMLError:
+                pass
+
+        # --- GPU memory via PyTorch ---
+        if th.cuda.is_available():
+            try:
+                free, _ = th.cuda.mem_get_info()
+                mem_ava_gb =  free / (1024 ** 3)
+            except Exception:
+                pass
+
+        return util_pct, mem_ava_gb
+
+    def _is_merge_pending_or_running(self) -> bool:
+        """Return True if any merge is pending or in progress."""
+        with self._merge_count_lock:
+            return self._merge_count > 0
+
+    def _collect_gpu_window(self, window_seconds=15.0, sample_interval=0.5):
+        """Collect GPU stats over a sliding window, return (avg_util, avg_mem_avail_gb)."""
+        util_samples = []
+        mem_samples = []
+        deadline = time.monotonic() + window_seconds
+        while time.monotonic() < deadline:
+            util_pct, mem_gb = self._get_gpu_stats()
+            if util_pct is not None:
+                util_samples.append(util_pct)
+            if mem_gb is not None:
+                mem_samples.append(mem_gb)
+            time.sleep(sample_interval)
+
+        avg_util = sum(util_samples) / len(util_samples) if util_samples else None
+        avg_mem = sum(mem_samples) / len(mem_samples) if mem_samples else None
+        return avg_util, avg_mem
+
+    def _wait_for_merge_idle(self) -> bool:
+        """Block until merge GPU usage settles.
+
+        Keeps polling indefinitely (no timeout): the only way out is
+        (a) all merges complete, or (b) the window averages fall below
+        thresholds.  Logs a warning every *merge_idle_timeout* seconds
+        to indicate it is still waiting.
+
+        Returns True when idle, False if interrupted (should never happen).
+        """
+        window_s = self.merge_idle_window_seconds
+        sample_iv = self.merge_idle_sample_interval
+        next_warn_at = self.merge_idle_timeout
+
+        while True:
+            if not self._is_merge_pending_or_running():
+                return True  # all merges done — safe
+
+            avg_util, avg_mem = self._collect_gpu_window(window_s, sample_iv)
+
+            util_ok = avg_util is None or avg_util <= self.merge_gpu_util_threshold
+            mem_ok = avg_mem is None or avg_mem >= self.merge_gpu_mem_threshold_gb
+
+            if util_ok and mem_ok:
+                logger.info(
+                    f"{BLUE}Merge idle (window avg): "
+                    f"GPU util={avg_util:.1f}%%, mem avail={avg_mem:.2f} GB{RESET}"
+                )
+                return True
+
+            elapsed = time.monotonic()  # approximate; fine for periodic warning
+            if elapsed >= next_warn_at:
+                logger.warning(
+                    f"{YELLOW}Still waiting for merge to settle "
+                    f"(GPU util={avg_util:.1f}%%, mem avail={avg_mem:.2f} GB). "
+                    f"Will retry...{RESET}"
+                )
+                next_warn_at = elapsed + self.merge_idle_timeout
+            else:
+                logger.info(
+                    f"{YELLOW}Merge still busy (window avg): "
+                    f"GPU util={avg_util:.1f}%% (thresh={self.merge_gpu_util_threshold}%%), "
+                    f"mem avail={avg_mem:.2f} GB (thresh={self.merge_gpu_mem_threshold_gb} GB){RESET}"
+                )
+
     def gpu_workload0(self, idx, video, audio, width, height):
         try:
             job_start = time.time()
             file_monitor = None
-            
             
             """Extract Video and Audio Name"""
             audio_name = os.path.join(self.operation_path, audio)
@@ -193,14 +310,14 @@ class VideoProc:
             subtitle_name = os.path.join(sub_file_name, f"{clean_stem}_subscript.srt")
 
             """Start Processing"""
-            file_monitor.set_workload("separation")
+            file_monitor.set_workload("分离")
             def on_save_start(vocals, sr, total_frames, ori_sr, *args):
-                file_monitor.set_workload("recognition")
+                file_monitor.set_workload("转录")
                 english_sentences, _ = self.recognition.recognition(vocals, sr, self.debug_en, ref_audio_name)
-                file_monitor.set_workload("translation")
+                file_monitor.set_workload("翻译")
                 total_sentences = self.translation.Subscript_Translation_Srt_Generation(english_sentences, subtitle_name)
-                file_monitor.set_workload("synthesis")
-                self.synthesis.synthesize_parallel(
+                file_monitor.set_workload("语音克隆")
+                self.merge_gpu_mem_threshold_gb = self.synthesis.synthesize_parallel(
                     total_sentences, 
                     sr, 
                     total_frames,
@@ -219,12 +336,12 @@ class VideoProc:
                 # file_monitor.set_workload("recognition_translation_synthesis")
                 recog_future.result()
             else:
-                file_monitor.set_workload("recognition")
+                file_monitor.set_workload("转录")
                 english_sentences, _ = self.recognition.recognition(vocals, sr, 0, ref_audio_name)
-                file_monitor.set_workload("translation")
+                file_monitor.set_workload("翻译")
                 total_sentences = self.translation.Subscript_Translation_Srt_Generation(english_sentences, subtitle_name)
-                file_monitor.set_workload("synthesis")
-                self.synthesis.synthesize_parallel(
+                file_monitor.set_workload("语音克隆")
+                self.merge_gpu_mem_threshold_gb = self.synthesis.synthesize_parallel(
                     total_sentences, 
                     sr, 
                     total_frames,
@@ -269,14 +386,14 @@ class VideoProc:
     def gpu_workload1(self, preprocess_result):
 
         if not preprocess_result["success"]:
-            logger.error(f"{RED}Skip {preprocess_result.get("idx")}th File{RESET}")
+            logger.error(f"{RED}Skip {preprocess_result.get('idx')}th File{RESET}")
             return
         
         file_monitor = preprocess_result.get("file_monitor")
         try:
             if file_monitor is not None:
-                file_monitor.set_workload("video_merge")
-            logger.info(f"{PUPPLE}Start Video Merging for the {preprocess_result.get("idx")} th File{RESET}")
+                file_monitor.set_workload("视频合成")
+            logger.info(f"{PUPPLE}Start Video Merging for the {preprocess_result.get('idx')} th File{RESET}")
             flag = compose_video(        
                 video_path=preprocess_result["video_name"],
                 subtitle_path=preprocess_result["subtitle_name"],
@@ -333,6 +450,8 @@ class VideoProc:
             logger.info(f"{GREEN}Total Processing time for {idx}th file is {hours}hour, {minutes}minutes, {seconds}seconds and {miliseconds}ms{RESET}")
         finally:
             gpu1_sem.release()
+            with self._merge_count_lock:
+                self._merge_count -= 1
 
     def process(self):
         start_time = time.time()
@@ -356,8 +475,22 @@ class VideoProc:
             gpu1_sem = threading.Semaphore(self.max_cpu_queue_size)
 
             def task_pipeline(idx, video, audio, width, height):
-                with gpu0_sem:
+                # Wait until any ongoing merge has settled before starting
+                # heavy GPU work (synthesis/vLLM) for the next file
+                if idx > 1:
+                    self._wait_for_merge_idle()
+
+                gpu0_sem.acquire()
+                try:
                     result = self.gpu_workload0(idx, video, audio, width, height)
+                    # Signal merge-pending BEFORE releasing gpu0_sem,
+                    # so the next file's _wait_for_merge_idle sees it.
+                    if result["success"]:
+                        with self._merge_count_lock:
+                            self._merge_count += 1
+                finally:
+                    gpu0_sem.release()
+
                 if not result["success"]:
                     logger.error(f"Skip {idx} due to workload0 failure")
                     return

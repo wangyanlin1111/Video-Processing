@@ -32,7 +32,8 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Error occurred: {e}")
         traceback.print_exc()
-    # os.system("/usr/bin/shutdown")
+    if debug_en == False:
+        os.system("/usr/bin/shutdown")
 
 
 

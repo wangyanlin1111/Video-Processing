@@ -2,6 +2,7 @@ import os
 import random
 import re
 import time
+import gc
 import traceback
 from typing import List
 import uuid
@@ -159,8 +160,13 @@ class IndexTTS2:
             is_distributed=False,
         )
         self.s2mel = s2mel.to(self.device)
-        self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
+        self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=2048)
         self.s2mel.eval()
+        self.s2mel.models['cfm'].estimator = torch.compile(
+            self.s2mel.models['cfm'].estimator, 
+            mode="reduce-overhead", 
+            fullgraph=False
+        )
         logger.info(f">> s2mel weights restored from: {s2mel_path}")
 
         # load campplus_model
@@ -351,7 +357,7 @@ class IndexTTS2:
                                                                         n_quantizers=3,
                                                                         f0=None)[0]
             del audio, audio_22k, audio_16k, inputs, input_features, attention_mask, S_ref, feat                                                              
-        if emo_ref == 1:
+        if emo_reset == 1:
             emo_audio, _ = librosa.load(emo_audio_prompt, sr=16000)
             emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
             emo_input_features = emo_inputs["input_features"]
@@ -481,7 +487,7 @@ class IndexTTS2:
                 dtype = None
                 with torch.amp.autocast(text_tokens.device.type, enabled=dtype is not None, dtype=dtype):
                     m_start_time = time.perf_counter()
-                    diffusion_steps = 25
+                    diffusion_steps = 10
                     inference_cfg_rate = 0.7
                     latent = self.s2mel.models['gpt_layer'](latent)
                     S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
@@ -512,9 +518,13 @@ class IndexTTS2:
                 wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
                 if verbose:
                     print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
-                # wavs.append(wav[:, :-512])
-                # logger.error(f"time per token: {wav.shape[-1] / sampling_rate / codes.shape[-1]}, {wav.shape[-1] / sampling_rate / vc_target.shape[-1]}")
                 wavs.append(wav.cpu())  # to cpu before saving
+
+                # Per-sentence cleanup: free intermediate tensors to keep peak memory low
+                del latent, S_infer, cond, cat_condition, vc_target, wav, text_tokens, codes, code_lens
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
         end_time = time.perf_counter()
 
         wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)

@@ -284,17 +284,17 @@ class Recognition:
                 sf.write(ref_audio_path, mono_audio.cpu().float().numpy(), sr)
             ref_text = english_sentences[idx]["text"]
             """Save debug info"""   
-            if debug_en == True:
-                with open(r"EnglishContent_origin.txt", "w", encoding="utf-8") as f0:
-                    for i, segment in enumerate(segments_list):
-                        f0.write(f"{i}\n")
-                        f0.write(format_time(segment.start) + "\t"+ "->" + format_time(segment.end) + "\n")
-                        f0.write(segment.text + "\n\n") 
-                with open(r"EnglishContent_merged.txt", "w", encoding="utf-8") as f1:
-                    for i, segment in enumerate(english_sentences):
-                        f1.write(f"{i}\n")
-                        f1.write(format_time(segment["start"]) + "\t"+ "->" + format_time(segment["end"]) + "\n")
-                        f1.write(segment["text"] + "\n\n")    
+            # if debug_en == True:
+            #     with open(r"EnglishContent_origin.txt", "w", encoding="utf-8") as f0:
+            #         for i, segment in enumerate(segments_list):
+            #             f0.write(f"{i}\n")
+            #             f0.write(format_time(segment.start) + "\t"+ "->" + format_time(segment.end) + "\n")
+            #             f0.write(segment.text + "\n\n") 
+            #     with open(r"EnglishContent_merged.txt", "w", encoding="utf-8") as f1:
+            #         for i, segment in enumerate(english_sentences):
+            #             f1.write(f"{i}\n")
+            #             f1.write(format_time(segment["start"]) + "\t"+ "->" + format_time(segment["end"]) + "\n")
+            #             f1.write(segment["text"] + "\n\n")    
 
             """Clear Memory"""
             del audio_recognization, segments_generator, segments_list
