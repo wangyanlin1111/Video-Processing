@@ -54,54 +54,20 @@ default_text = "我们的星球已经经历了数十亿年的各种灾难性事�
 default_language = "Chinese"
 
 class VoiceSynthesis:
-    def __init__(self, batchsize: int = None, gen_model_path: str = None, syn_model_path: str = None, instruction: str = None):
-        default_instruction = instruction if instruction is not None else "45岁男性, 低沉有磁性, 颗粒感强, 语速非常快, 句子间间隔短"
-        init_start_time = time.time()
+    def __init__(self, batchsize: int = None, gen_model_path: str = None, syn_model_path: str = None):
         self.VOCALPATH = "vocal_clone.mp3"
         self.BATCHSIZE = batchsize if batchsize is not None else 10
-        self.REFINSTRUCTION = default_instruction
         self.DEVICE = "cuda" if th.cuda.is_available() else "cpu"
         self.DTYPE = th.bfloat16 if self.DEVICE == "cuda" else th.float32
         if syn_model_path is not None:
             self.MODELNAME = syn_model_path 
         else:
             self.MODELNAME = "Qwen/Qwen3-TTS-12Hz-1.7B-Base" if self.DEVICE == "cuda" else "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
-        _gen_model_name_path = gen_model_path if gen_model_path is not None else "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
         self.ATTENTION = "flash_attention_2" if self.DEVICE == "cuda" else "eager"
         self.SAMPLERATE = Qwen3TTSModel_SAMPLE_RATE
         self.calibrationsampler = T.Resample(orig_freq=self.SAMPLERATE, new_freq=self.SAMPLERATE).to(self.DEVICE)
-        """First Design the reference audio for voice clone"""
         self.SYNTHESISMODEL = None
         self.VOICECLONEPROMPT = None
-        design_model = Qwen3TTSModel.from_pretrained(
-            _gen_model_name_path,
-            device_map = self.DEVICE,
-            dtype = self.DTYPE,
-            attn_implementation = self.ATTENTION,
-        )
-        ref_wavs, sr = design_model.generate_voice_design(
-            text = default_text,
-            language = default_language,
-            instruct = default_instruction
-        )
-        ref_audio_withzeros = np.concatenate([np.zeros(int(0.5 * sr)), ref_wavs[0], np.zeros(int(0.5 * sr))])
-        """Empty Cache"""
-        del design_model
-        gc.collect()
-        th.cuda.empty_cache()
-        """Then generate the synthesis model"""
-        self.SYNTHESISMODEL = Qwen3TTSModel.from_pretrained(
-            self.MODELNAME,
-            device_map = self.DEVICE,
-            dtype = self.DTYPE,
-            attn_implementation= self.ATTENTION
-        )
-        self.VOICECLONEPROMPT = self.SYNTHESISMODEL.create_voice_clone_prompt(
-            ref_audio=(ref_audio_withzeros, sr),   
-            ref_text=default_text,
-        )
-        init_end_time = time.time()
-        logger.info(f"{GREEN}Voice Synthesis Init Time: {init_end_time - init_start_time:.4f}s{RESET}")
         self._resampler_cache = {}
         self._silence_cache = {}
         if self.DEVICE == "cuda":
@@ -278,21 +244,11 @@ class VoiceSynthesis:
             ori_len, 
             ori_sr, 
             debug_en : bool=False, 
-            vocal_path : str=None
+            vocal_path : str=None,
+            ref_audio_path : str=None
         ):
 
         total_start_time = time.time()
-        if self.SYNTHESISMODEL is None:
-            self.SYNTHESISMODEL = Qwen3TTSModel.from_pretrained(
-                self.MODELNAME,
-                device_map = self.DEVICE,
-                dtype = self.DTYPE,
-                attn_implementation= self.ATTENTION
-            )
-            self.VOICECLONEPROMPT = self.SYNTHESISMODEL.create_voice_clone_prompt(
-                ref_audio=ref_audio_path,   
-                ref_text=ref_text,
-            )
         prev_end_sample = 0
         N = len(total_sentences)
         iteration_num = math.ceil(N / self.BATCHSIZE)
@@ -319,6 +275,9 @@ class VoiceSynthesis:
             writer_thread.start()
             reset_time = 0
             for i in range(iteration_num):
+                if self.SYNTHESISMODEL is not None and self.VOICECLONEPROMPT is not None:
+                    del self.SYNTHESISMODEL, self.VOICECLONEPROMPT
+                    gc.collect()
                 audio_segment = th.tensor([], dtype = self.DTYPE, device = self.DEVICE)
                 start_idx = i * self.BATCHSIZE
                 end_idx = min((i + 1)  * self.BATCHSIZE, N)
@@ -326,16 +285,18 @@ class VoiceSynthesis:
                 index_mask = np.arange(start_idx, end_idx)
                 texts = [total_sentences[j]["chinese"].strip() for j in index_mask]
                 starts = [total_sentences[j]["start"] for j in index_mask]
-                if starts[0] - reset_time > 7200:
-                    """If the start time of the current batch is more than 2 hour away from the reset_time, then reset the synthesis model to avoid potential memory leak issue in long video synthesis"""
-                    del self.SYNTHESISMODEL
-                    self.SYNTHESISMODEL = Qwen3TTSModel.from_pretrained(
-                        self.MODELNAME,
-                        device_map = self.DEVICE,
-                        dtype = self.DTYPE,
-                        attn_implementation= self.ATTENTION
-                    )
-                    reset_time = starts[0]
+                """Reset Synthesis Model"""
+                self.SYNTHESISMODEL = Qwen3TTSModel.from_pretrained(
+                    self.MODELNAME,
+                    device_map = self.DEVICE,
+                    dtype = self.DTYPE,
+                    attn_implementation = self.ATTENTION
+                )
+                self.VOICECLONEPROMPT = self.SYNTHESISMODEL.create_voice_clone_prompt(
+                    ref_audio = ref_audio_path,   
+                    x_vector_only_mode = True,
+                )
+
                 """Synthesize audios in batch and calibrate the audio length according to the time difference"""
                 audios = self.synthesize_batch(texts, speed=1.2)
                 current_length = np.array([len(audio) for audio in audios])
@@ -408,12 +369,13 @@ class VoiceSynthesis:
             if debug_en == True:
                 file.close()
 
+        total_end_time = time.time()
+        hours,minutes,seconds,miliseconds = converttime(total_end_time - total_start_time)
+        logger.info(f"{GREEN}Synthesis Time is {hours} hours, {minutes} minutes, {seconds} seconds and {miliseconds} ms{RESET}")
+        del self.SYNTHESISMODEL, self.VOICECLONEPROMPT
         gc.collect()
         if self.DEVICE == "cuda":
             th.cuda.synchronize()
             th.cuda.empty_cache()
             free, _ = th.cuda.mem_get_info()
-            logger.info(f"{YELLOW}After Vocal Synthesis Free: {free / 1024 ** 3:.2f} GB{RESET}")
-        total_end_time = time.time()
-        hours,minutes,seconds,miliseconds = converttime(total_end_time - total_start_time)
-        logger.info(f"{GREEN}Synthesis Time is {hours} hours, {minutes} minutes, {seconds} seconds and {miliseconds} ms{RESET}")
+            logger.info(f"{YELLOW}After Synthesis Model Release Free: {free / 1024 ** 3:.2f} GB{RESET}")

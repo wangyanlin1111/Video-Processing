@@ -3,7 +3,8 @@
 # import json
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
+# expandable_segments is incompatible with vLLM memory pool, must NOT be set
+# os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -46,9 +47,11 @@ import gc
 import torch as th
 import time
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from vllm import LLM, SamplingParams
 from commonfunc import converttime
 
 MODEL_NAME ="tencent/HY-MT1.5-1.8B"
+VLLM_BATCH_SIZE = 50
 
 RED = "\033[91m"    
 GREEN = "\033[92m"  
@@ -142,37 +145,7 @@ class SubscriptTranslation:
                 logger.error(f"{RED}Failed to initialize Transformer service: {e}{RESET}")
                 raise
         elif self.OPTION == 2:
-            self.GPU_MENORY_UTILIZATION = gpu_memory_utilization if gpu_memory_utilization is not None else 0.6
-            try:
-                self.sampling_params = SamplingParams(
-                    temperature=0.0,
-                    max_tokens=64,
-                    stop=["<|endoftext|>", "<|end|>", "</s>", "\n\n"],
-                    repetition_penalty=1.05
-                )
-    
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    MODEL_NAME, 
-                    trust_remote_code=True
-                )
-                self.llm = LLM(
-                    model=MODEL_NAME,
-                    disable_log_stats=True,
-                    use_tqdm_on_load=False,
-                    gpu_memory_utilization=self.GPU_MENORY_UTILIZATION,
-                    trust_remote_code=True,
-                    dtype="bfloat16",               
-                    max_model_len=512,
-                    max_num_batched_tokens=256,
-                    enforce_eager=False, 
-                    max_num_seqs=8,
-                    kv_cache_dtype="fp8",
-                    quantization=None,
-                )
-            except Exception as e:
-                """Throw Exception"""
-                logger.error(f"{RED}Failed to initialize vllm service: {e}{RESET}")
-                raise
+            self.GPU_MENORY_UTILIZATION = gpu_memory_utilization if gpu_memory_utilization is not None else 0.75
         init_end_time = time.time()
         logger.info(f"{GREEN}Subscript Translation Init Time: {init_end_time - init_start_time:.4f}s{RESET}")
         translate_method = "transformer" if self.OPTION == 0 else "vllm"
@@ -185,34 +158,77 @@ class SubscriptTranslation:
         """
         Translate in batch manner
         """
-        """Build Batch prompts"""
-        start_time = time.time()
-        prompts = []
-        # for text in english_sentences:
-        for sentence in english_sentences:
-            text = sentence["text"]
-            messages = [{"role": "user", "content": f"Translate this to Chinese: {text}"}]
-            prompt = self.tokenizer.apply_chat_template(
-                messages, 
-                tokenize=False, 
-                add_generation_prompt=True
+        try:
+            init_start_time = time.time()
+            sampling_params = SamplingParams(
+                temperature=0.0,
+                max_tokens=512,
+                stop=["<|end|>", "</s>", "\n\n"],
+                repetition_penalty=1.05
             )
-            prompts.append(prompt)
-        """Batch Translation"""
-        outputs = self.llm.generate(
-            prompts, 
-            self.sampling_params,
-            use_tqdm=False
-        )
-        chinese_sentences = []
-        for output in outputs:
-            if output.outputs:
-                chinese_sentences.append(output.outputs[0].text.strip())
-            else:
-                chinese_sentences.append("")
-        end_time = time.time()
-        logger.info(f"{GREEN}Translate via vllm service Time: {end_time - start_time:.4f}s{RESET}")
-        return chinese_sentences
+            tokenizer = AutoTokenizer.from_pretrained(
+                MODEL_NAME, 
+                trust_remote_code=True
+            )
+            llm = LLM(
+                model=MODEL_NAME,
+                disable_log_stats=True,
+                use_tqdm_on_load=False,
+                gpu_memory_utilization=self.GPU_MENORY_UTILIZATION,
+                trust_remote_code=True,
+                dtype="bfloat16",               
+                max_model_len=8192,
+                max_num_batched_tokens=8192,
+                enforce_eager=False, 
+                max_num_seqs=32,
+                kv_cache_dtype="fp8",
+                quantization=None,
+            )
+            init_end_time = time.time()
+            logger.info(f"{GREEN}Translate via vllm initialize Time: {init_end_time - init_start_time:.4f}s{RESET}")
+            """Build Batch prompts"""
+            start_time = time.time()
+            iteration_num = (len(english_sentences) + VLLM_BATCH_SIZE - 1) // VLLM_BATCH_SIZE
+            chinese_sentences = []
+            for i in range(iteration_num):
+                prompts = []
+                startpoint = i * VLLM_BATCH_SIZE
+                endpoint = min((i + 1) * VLLM_BATCH_SIZE, len(english_sentences))
+                batch_sentences = english_sentences[startpoint:endpoint]
+                text_batch = [sentence["text"] for sentence in batch_sentences]
+                for text in text_batch:
+                    # Truncate text if tokenized prompt would exceed model context
+                    max_input_tokens = 8192 - 512  # reserve 512 for output
+                    messages = [{"role": "user", "content": f"Translate the following English text into Chinese without any additional explanation and keep the original long sentence structure:\n\n{text}"}]
+                    prompt = tokenizer.apply_chat_template(
+                        messages, 
+                        tokenize=False, 
+                        add_generation_prompt=True
+                    )
+                    # Safety: truncate from raw text end if prompt still too long
+                    token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+                    if len(token_ids) > max_input_tokens:
+                        truncated_ids = token_ids[:max_input_tokens]
+                        prompt = tokenizer.decode(truncated_ids, skip_special_tokens=True)
+                    prompts.append(prompt)
+                """Batch Translation"""
+                outputs = llm.generate(
+                    prompts, 
+                    sampling_params,
+                    use_tqdm=False
+                )
+                for output in outputs:
+                    if output.outputs:
+                        chinese_sentences.append(output.outputs[0].text.strip())
+                    else:
+                        chinese_sentences.append("")
+            end_time = time.time()
+            logger.info(f"{GREEN}Translate via vllm service Time: {end_time - start_time:.4f}s{RESET}")
+            return chinese_sentences
+        except Exception as e:
+            """Throw Exception"""
+            logger.error(f"{RED}Failed to initialize vllm service: {e}{RESET}")
+            raise       
 
     def translate_via_transformer(self, english_sentences) -> list[str]:
         """
@@ -248,8 +264,8 @@ class SubscriptTranslation:
                     max_new_tokens=1024,
                     temperature=0.1,
                     do_sample=False,
-                    num_beams=1,                         # 贪婪解码，输出最稳定
-                    repetition_penalty=1.2,         # 小幅抑制重复，可增强句式多样性
+                    num_beams=1,                         # Greedy decoding, most stable output
+                    repetition_penalty=1.2,         # Slightly suppress repetition, enhances sentence diversity
                     pad_token_id=self.tokenizer.eos_token_id,
                     eos_token_id=self.tokenizer.eos_token_id
                 )
