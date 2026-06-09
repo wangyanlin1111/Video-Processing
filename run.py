@@ -1,6 +1,7 @@
 import traceback
 import multiprocessing
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 os.environ["OMP_NUM_THREADS"] = str(multiprocessing.cpu_count())
 
@@ -21,8 +22,8 @@ if __name__ == '__main__':
         video_proc = VideoProc(
             debug_en = debug_en, 
             sentence_len_in_second = 7, 
-            translation_mode = 0, 
-            synthesis_batch_size = 16, 
+            translation_mode = 2, 
+            synthesis_batch_size = 128, 
             operation_path = operation_path, 
             h256flag = True, 
             max_cpu_queue_size = 5,

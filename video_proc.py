@@ -117,6 +117,7 @@ def classify_video_audio_and_matched_pairs(folder_path):
     
     audio_dict = {os.path.splitext(a)[0]: a for a in audio_files}
     matched = []
+    total_duration = 0.0
     for video in video_files:
         base = os.path.splitext(video)[0]
         if base in audio_dict:
@@ -124,8 +125,11 @@ def classify_video_audio_and_matched_pairs(folder_path):
             dur = audio_duration.get(audio_file, 0.0)
             w, h = video_info.get(video, (None, None))
             matched.append((video, audio_dict[base], w, h, dur))
+            total_duration += dur
     matched.sort(key=lambda x: x[4], reverse=True)
     final_matched = [(item[0], item[1], item[2], item[3]) for item in matched]
+    hours,minutes,seconds,miliseconds = converttime(total_duration)
+    logger.info(f"{GREEN}Total time for all video files is {hours}hour, {minutes}minutes, {seconds}seconds and {miliseconds}ms{RESET}")
     return final_matched
 
 class VideoProc:

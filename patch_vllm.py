@@ -7,7 +7,7 @@ import importlib
 
 vllm_version = version.parse(importlib.import_module("vllm").__version__)
 
-# 在 vllm 中注册自定义的 GPT2TTSModel
+# Register custom GPT2TTSModel in vllm
 from vllm import ModelRegistry
 from indextts.gpt.index_tts_gpt2_vllm_v1 import GPT2TTSModel
 
@@ -15,7 +15,7 @@ ModelRegistry.register_model("GPT2InferenceModel", GPT2TTSModel)
 # print("✅  Registry GPT2TTSModel to vllm")
 
 
-# 将 position_ids 减去 prefill 的长度再加 1，以便正确计算每一步 decode 的 position embedding
+# Subtract prefill length from position_ids and add 1 to correctly compute position embedding for each decode step
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 import numpy as np
 from vllm.v1.core.sched.output import SchedulerOutput

@@ -92,12 +92,12 @@ def compose_video(
         crf = 32  
         preset = "slow"
         extra_video_params = [
-            "-rc", "vbr_hq",        # 高质量VBR模式（比默认vbr更优）
-            "-cq", str(crf),        # NVENC的CQ对应CRF（恒定质量）
-            "-profile:v", "main10", # 10bit编码（色彩更准，压缩比更高）
-            "-spatial_aq", "1",     # 空间AQ开启
-            "-temporal_aq", "1",    # 时间AQ开启
-            "-bf", "4",             # 新增：启用B帧（硬件支持的话，提升压缩比）
+            "-rc", "vbr_hq",        # High-quality VBR mode (better than default vbr)
+            "-cq", str(crf),        # NVENC CQ corresponds to CRF (constant quality)
+            "-profile:v", "main10", # 10-bit encoding (more accurate colors, higher compression ratio)
+            "-spatial_aq", "1",     # Enable spatial AQ
+            "-temporal_aq", "1",    # Enable temporal AQ
+            "-bf", "4",             # Enable B-frames (improves compression ratio if hardware supports)
         ]
     else:
         crf = 28
@@ -126,8 +126,8 @@ def compose_video(
         '-b:a', '128k',
         '-ac', '2',
         '-movflags', '+faststart', 
-        '-vsync', 'cfr',  # 强制恒定帧率，避免重复帧
-        '-flags', '+cgop',  # 关键帧间隔优化，提升压缩比
+        '-vsync', 'cfr',  # Force constant frame rate to avoid duplicate frames
+        '-flags', '+cgop',  # Optimize keyframe interval to improve compression ratio
         output_path
     ]
     total_start_time = time.time()

@@ -56,7 +56,7 @@ PUPPLE = "\033[95m"
 RESET = "\033[0m"
 
 Qwen3TTSModel_SAMPLE_RATE = 24000   #24KHz
-Advance_Time = 50 / 1000           #50ms
+Advance_Time = 100 / 1000           #100ms
 Advance_SAMPLE = int(Advance_Time * Qwen3TTSModel_SAMPLE_RATE)
 
 
@@ -170,7 +170,6 @@ def parse_args(args=None):
         "-q",
         type=str,
         default="Base",
-        # choices=query_map.keys(),
         help="Query type.",
     )
     parser.add_argument(
@@ -369,7 +368,7 @@ class VoiceSynthesisVLLMQwen3TTS:
         try:
             inputs = self.build_inputs(ref_audio_path, ref_text, syn_text_batch)
             indexed_audios = []  # (idx, audio_tensor)
-            # Pass ALL inputs at once so vLLM can batch them internally
+            """Pass ALL inputs at once so vLLM can batch them internally"""
             for stage_outputs in omni.generate(inputs):
                 output = stage_outputs.request_output
                 mm = output.outputs[0].multimodal_output
@@ -378,15 +377,15 @@ class VoiceSynthesisVLLMQwen3TTS:
                 audio_data = mm["audio"]
                 audio_tensor = th.cat(audio_data, dim=-1) if isinstance(audio_data, list) else audio_data
                 audio_tensor = audio_tensor.to(self.DEVICE, self.DTYPE)
-                # Extract index from request metadata to restore original order
+                """Extract index from request metadata to restore original order"""
                 indexed_audios.append((idx, audio_tensor))
-            # Sort by original index and return just the tensors
+            """Sort by original index and return just the tensors"""
             indexed_audios.sort(key=lambda x: x[0])
             audios = [audio for _, audio in indexed_audios]
             return audios
         except Exception as e:
             error_detail = get_error_detail(e)
-            # Write to both stderr (fd 2 may be redirected) and via logger
+            """ Write to both stderr (fd 2 may be redirected) and via logger """
             print(f"{RED}{error_detail}{RESET}", file=sys.stderr, flush=True)
             logger.error(error_detail)
             raise RuntimeError(f"Single generation failed") from e
@@ -402,13 +401,13 @@ class VoiceSynthesisVLLMQwen3TTS:
             ref_audio : str=None,
             ref_text:str=None,
         ):
-        # Route logger to stdout before stderr is redirected to /dev/null
+        """Route logger to stdout before stderr is redirected to /dev/null"""
         _stdout_handler = logging.StreamHandler(sys.stdout)
         _stdout_handler.setLevel(logging.INFO)
         _stdout_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
         logger.addHandler(_stdout_handler)
 
-        # -- Redirect stderr at the OS file-descriptor level -------------------
+        """ -- Redirect stderr at the OS file-descriptor level -------------------"""
         _stderr_fd = sys.stderr.fileno()
         _saved_fd = os.dup(_stderr_fd)
         _devnull_fd = os.open(os.devnull, os.O_WRONLY)
@@ -476,7 +475,7 @@ class VoiceSynthesisVLLMQwen3TTS:
                             real_calibration_factor = math.ceil(current_length[k] / target_length[k] * 100) / 100
                             """If calibration_factor is less than 1.15, then speed up the original synthesised vocal"""
                             """Else speed up 1.25x and advance the next few sentences 100ms each according to the time difference"""
-                            calibration_factor = min(real_calibration_factor, 1.15)
+                            calibration_factor = min(real_calibration_factor, 1.25)
                             audio_np = audios[k].squeeze().cpu().to(th.float32).numpy()
                             stretched_audio_np = pyrb.time_stretch(audio_np, self.SAMPLERATE, rate = calibration_factor)
                             audios[k] = th.from_numpy(stretched_audio_np).to(self.DEVICE, self.DTYPE)
