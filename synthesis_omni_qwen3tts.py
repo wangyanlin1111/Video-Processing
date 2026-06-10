@@ -39,12 +39,9 @@ import numpy as np
 import torch as th
 import soundfile as sf
 import torchaudio.transforms as T
-import pyrubberband as pyrb
 
-from qwen_tts import Qwen3TTSModel
-from transformers import AutoTokenizer
 from typing import Any
-from vllm_omni import AsyncOmni,Omni
+from vllm_omni import Omni
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 from commonfunc import converttime, get_error_detail
 
@@ -78,6 +75,7 @@ def _estimate_prompt_len(
         )
 
         if model_name not in _cache:
+            from transformers import AutoTokenizer
             tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="left")
             cfg = Qwen3TTSConfig.from_pretrained(model_name, trust_remote_code=True)
 
@@ -292,6 +290,7 @@ class VoiceSynthesisVLLMQwen3TTS:
         self._resampler_cache = {}
         self._silence_cache = {}
         self._args = parse_args(args=[])
+        self._stdout_handler_added = False
         if self.DEVICE == "cuda":
             free, total = th.cuda.mem_get_info()
             logger.info(f"{YELLOW}Voice Synthesis Allocated: All: {total / 1024 ** 3:.2f} GB, Free: {free / 1024 ** 3:.2f} GB{RESET}")
@@ -338,7 +337,6 @@ class VoiceSynthesisVLLMQwen3TTS:
                 "ref_audio": [ref_audio],
                 "ref_text": [ref_text],
                 "text": [text],
-                "speed":[1.5],
                 "language": ["Chinese"],
                 "x_vector_only_mode": [mode_tag == "xvec_only"],
                 "max_new_tokens": [2048]
@@ -389,6 +387,58 @@ class VoiceSynthesisVLLMQwen3TTS:
             print(f"{RED}{error_detail}{RESET}", file=sys.stderr, flush=True)
             logger.error(error_detail)
             raise RuntimeError(f"Single generation failed") from e
+        
+    def apply_speed_adjustment(self, audio_tensor: np.ndarray, speed: float):
+        """Apply speed adjustment to the audio tensor while preserving pitch.
+
+        Uses torchaudio's phase vocoder (Spectrogram → TimeStretch →
+        InverseSpectrogram) to stretch/compress audio in time without
+        changing pitch.
+        """
+        if speed == 1.0:
+            return audio_tensor
+
+        try:
+            if not np.issubdtype(audio_tensor.dtype, np.floating):
+                audio_tensor = audio_tensor.astype(np.float32)
+
+            # Stereo numpy arrays use channels-last (T, C);
+            # torch expects channels-first (C, T).
+            channels_last = audio_tensor.ndim == 2
+            if channels_last:
+                waveform = th.from_numpy(audio_tensor.T)
+            else:
+                waveform = th.from_numpy(audio_tensor).unsqueeze(0)
+
+            # Match librosa.stft defaults: n_fft=2048, hop_length=n_fft//4
+            n_fft = 512
+            hop_length = n_fft // 4
+            to_spec = torchaudio.transforms.Spectrogram(
+                n_fft=n_fft,
+                hop_length=hop_length,
+                power=None,
+            )
+            stretch = torchaudio.transforms.TimeStretch(
+                n_freq=n_fft // 2 + 1,
+                hop_length=hop_length,
+            )
+            to_wave = torchaudio.transforms.InverseSpectrogram(
+                n_fft=n_fft,
+                hop_length=hop_length,
+            )
+
+            spec = to_spec(waveform)
+            stretched = stretch(spec, speed)
+            expected_length = int(audio_tensor.shape[0] / speed)
+            result = to_wave(stretched, length=expected_length)
+
+            result = result.squeeze(0).numpy()
+            if channels_last:
+                result = result.T
+            return result
+        except Exception as e:
+            logger.error(f"An error occurred during speed adjustment: {e}")
+            raise ValueError("Failed to apply speed adjustment.") from e
 
     def synthesize_parallel(
             self, 
@@ -402,10 +452,12 @@ class VoiceSynthesisVLLMQwen3TTS:
             ref_text:str=None,
         ):
         """Route logger to stdout before stderr is redirected to /dev/null"""
-        _stdout_handler = logging.StreamHandler(sys.stdout)
-        _stdout_handler.setLevel(logging.INFO)
-        _stdout_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-        logger.addHandler(_stdout_handler)
+        if not self._stdout_handler_added:
+            _stdout_handler = logging.StreamHandler(sys.stdout)
+            _stdout_handler.setLevel(logging.INFO)
+            _stdout_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+            logger.addHandler(_stdout_handler)
+            self._stdout_handler_added = True
 
         """ -- Redirect stderr at the OS file-descriptor level -------------------"""
         _stderr_fd = sys.stderr.fileno()
@@ -463,41 +515,37 @@ class VoiceSynthesisVLLMQwen3TTS:
                     target_length = []
                     for j in index_mask:
                         real_duration = total_sentences[j]["end"] - total_sentences[j]["start"]
-                        correction_term = (total_sentences[j+1]["start"] - total_sentences[j]["end"]) * 0.85 if j != (N - 1) else 0
+                        correction_term = (total_sentences[j+1]["start"] - total_sentences[j]["end"]) * 0.95 if j != (N - 1) else 0
                         target_length.append(round((real_duration + correction_term) * self.SAMPLERATE))
                     target_length = np.array(target_length)
                     regenerate_flag = current_length > target_length
                     calibration_mask = index_mask[regenerate_flag] - start_idx
-
+                    advance_samples = [round((total_sentences[flag]["start"] - total_sentences[flag - 1]["end"]) * self.SAMPLERATE) if flag > 0 else 0 for flag in index_mask[regenerate_flag]]
+                    advance_flag = np.zeros(proc_num, dtype=int)
                     """If the generated audio is longer than the target length, then calibrate the audio by time-stretching and speed up the audio according to the time difference"""
                     if len(calibration_mask) > 0:
-                        for k in calibration_mask:
+                        for idx, k in enumerate(calibration_mask):
                             real_calibration_factor = math.ceil(current_length[k] / target_length[k] * 100) / 100
-                            """If calibration_factor is less than 1.15, then speed up the original synthesised vocal"""
-                            """Else speed up 1.25x and advance the next few sentences 100ms each according to the time difference"""
-                            calibration_factor = min(real_calibration_factor, 1.25)
-                            audio_np = audios[k].squeeze().cpu().to(th.float32).numpy()
-                            stretched_audio_np = pyrb.time_stretch(audio_np, self.SAMPLERATE, rate = calibration_factor)
+                            if (advance_samples[idx] > 0):
+                                advance_flag[idx] = 1
+                                calibration_factor = math.ceil(current_length[k] / (target_length[k] + advance_samples[idx]) * 100) / 100
+                            else:
+                                calibration_factor = real_calibration_factor
+                            audio_tensor = audios[k].squeeze().cpu().to(th.float32).numpy()
+                            stretched_audio_np = self.apply_speed_adjustment(audio_tensor, speed=calibration_factor)
                             audios[k] = th.from_numpy(stretched_audio_np).to(self.DEVICE, self.DTYPE)
-                            if (calibration_factor < real_calibration_factor):
-                                difference_samples = len(audios[k]) - target_length[k]
-                                num_advance += int(difference_samples // Advance_SAMPLE)
-                                advance_flag = 1
                             
                             if debug_en == True:
-                                content = f"The {k+start_idx}th data, Calibration Factor = {calibration_factor}, Target = {target_length[k]}, Original = {current_length[k]}, Updated = {len(audios[k])}"+"\n"
+                                content = f"The {k+start_idx}th data, Calibration Factor = {real_calibration_factor}, Target = {target_length[k]}, Original = {current_length[k]}, Updated = {len(audios[k])}"+"\n"
                                 file.write(content)
                     """Concatenate the audio segment with silence according to the time difference and write the audio segment into local file in each iteration to avoid OOM, which is caused by concatenating all audio segments in memory and writing once in the end"""
                     for j in range(proc_num):
                         start_sample = round(total_sentences[index_mask[j]]["start"] * self.SAMPLERATE)
-                        silence_samples = max(start_sample - prev_end_sample, 0)
-                        if advance_flag == 1 and silence_samples > Advance_SAMPLE:
-                            silence_samples -= Advance_SAMPLE
-                            num_advance -= 1
-                            advance_flag = 1 if num_advance > 0 else 0
-                        temp_silence = self.generate_silence(silence_samples)
-                        audio_segment = th.concatenate([audio_segment, temp_silence])
-                        del temp_silence
+                        silence_samples = 0 if advance_flag[j] == 1 else max(start_sample - prev_end_sample, 0)
+                        if silence_samples > 0:
+                            temp_silence = self.generate_silence(silence_samples)
+                            audio_segment = th.concatenate([audio_segment, temp_silence])
+                            del temp_silence
                         audio_segment = th.concatenate([audio_segment, audios[j]])
                         prev_end_sample += (silence_samples + len(audios[j]))
                     """Resample the audio segment to the target sampling rate if needed and write the audio segment into local file"""
